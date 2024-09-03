@@ -1,0 +1,1 @@
+java -classpath "%~dp0\synclite-validator.jar;%~dp0\*" com.synclite.validator.Main %1 %2 %3 %4 %5 %6 %7 %8 %9
