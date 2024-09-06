@@ -27,10 +27,11 @@ public class Main {
 	private static Path loggerConfig;
 	private static Path consolidatorConfig;
 	private static Path corePath;
-
+	private static Integer numThreads;
+	
 	public static void main(String[] args) {
 		try {
-			if (args.length != 9) {
+			if (args.length != 11) {
 				usage();
 			} else {
 				String cmd = args[0].trim().toLowerCase();
@@ -43,7 +44,7 @@ public class Main {
 				} else {
 					testRoot = Path.of(args[2]);
 					if (!Files.exists(testRoot)) {
-						error("Invalid test root directory specified");
+						error("Invalid test-root directory specified");
 					}
 				}
 
@@ -52,7 +53,7 @@ public class Main {
 				} else {
 					loggerConfig = Path.of(args[4]);
 					if (!Files.exists(loggerConfig)) {
-						error("Invalid logger config file specified");
+						error("Invalid logger-config file specified");
 					}
 				}				
 
@@ -62,7 +63,7 @@ public class Main {
 				} else {
 					consolidatorConfig  = Path.of(args[6]);
 					if (!Files.exists(consolidatorConfig)) {
-						error("Invalid consolidator config file specified");
+						error("Invalid consolidator-config file specified");
 					}
 				}
 
@@ -71,14 +72,24 @@ public class Main {
 				} else {
 					corePath = Path.of(args[8]);
 					if (!Files.exists(corePath)) {
-						error("Invalid core path specified");
+						error("Invalid core-path specified");
+					}
+				}
+
+				if (!args[9].trim().equals("--num-threads")) {
+					usage();
+				} else {
+					try {
+						numThreads = Integer.valueOf(args[10]);
+					} catch (NumberFormatException e) {
+						error("Invalid num-threads specified : " + e.getMessage());
 					}
 				}
 
 			}
 
 			//Start test execution			
-			TestDriver testDriver = new TestDriver(testRoot, loggerConfig, consolidatorConfig, corePath);
+			TestDriver testDriver = new TestDriver(testRoot, loggerConfig, consolidatorConfig, corePath, numThreads);
 			testDriver.run();
 
 		} catch (Exception e) {		
@@ -114,7 +125,7 @@ public class Main {
 	}
 
 	private static final void usage() {
-		System.out.println("ERROR : Usage: SyncLiteValidator test --test-root <path/to/test-root> --logger-config <path/to/logger-config> --consolidator-config <path/to/consolidator-config> --core-path <path/to/consolidator-clipath>");
+		System.out.println("ERROR : Usage: SyncLiteValidator test --test-root <path/to/test-root> --logger-config <path/to/logger-config> --consolidator-config <path/to/consolidator-config> --core-path <path/to/consolidator-clipath> --num-threads <number_of_threads>");
 		System.exit(1);
 	}
 }

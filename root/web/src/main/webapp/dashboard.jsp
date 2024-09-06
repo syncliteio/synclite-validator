@@ -94,8 +94,7 @@
                 	out.println("</tr>");
                 	out.println("<tr>");
                 	out.println("</tr>");
-                	out.println("</table>");
-					
+                	out.println("</table>");					
                 	                	
 					Class.forName("org.sqlite.JDBC");
                 
@@ -126,11 +125,15 @@
 		
 			                while (rs.next()) {
 			                	out.println("<tr>");
-			                	out.println("<td>" + rs.getString(1) + "</td>");
-			                	out.println("<td>" + rs.getString(2) + "</td>");
-			                	out.println("<td>" + rs.getString(3) + "</td>");
-			                	out.println("<td>" + rs.getString(4) + "</td>");
-			                	out.println("<td>" + rs.getString(5) + "</td>");
+			                	out.println("<td>" + rs.getString("test_name") + "</td>");
+			                	out.println("<td>" + rs.getString("start_time") + "</td>");
+			                	String endTime = rs.getString("end_time");
+			                	if (endTime == null) {
+			                		endTime = "";
+			                	}
+			                	out.println("<td>" + endTime + "</td>");
+			                	out.println("<td>" + rs.getString("execution_time") + "</td>");
+			                	out.println("<td>" + rs.getString("status") + "</td>");
 			                	out.println("</tr>");
 			                }
 		               	}
