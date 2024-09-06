@@ -126,6 +126,16 @@ public class ValidateJobConfiguration extends HttpServlet {
 				} 
 			}
 
+			String testNumThreadsStr = request.getParameter("test-num-threads");
+			try {
+				int numThreads = Integer.valueOf(testNumThreadsStr);
+				if (numThreads <= 0) {
+					throw new ServletException("\"Number of Threads\" must be a valid positive numeric value");
+				}
+			} catch (NumberFormatException e) {
+				throw new ServletException("\"Number of Threads\" must be a valid positive numeric value");
+			}
+
 
 			String loggerConfig = request.getParameter("logger-config");
 			Path loggerConfigPath;
@@ -309,11 +319,11 @@ public class ValidateJobConfiguration extends HttpServlet {
 					String scriptName = "synclite-validator.bat";
 					String scriptPath = Path.of(corePath, scriptName).toString();
 					//String cmd = "\"" + scriptPath + "\"" + " test --test-root " + "\"" + testRootPath +  "\"" + " --logger-config " + "\"" + loggerConfigPath + "\"" + " --consolidator-config " + "\"" + consolidatorConfigPathInWorkDir + "\"";
-					String[] cmdArray = {scriptPath.toString(), "test", "--test-root", testRootPath.toString(), "--logger-config", loggerConfigPath.toString(), "--consolidator-config", consolidatorConfigPathInWorkDir.toString(), "--core-path", corePath.toString()};
+					String[] cmdArray = {scriptPath.toString(), "test", "--test-root", testRootPath.toString(), "--logger-config", loggerConfigPath.toString(), "--consolidator-config", consolidatorConfigPathInWorkDir.toString(), "--core-path", corePath.toString(), "--num-threads", testNumThreadsStr};
 					if (executionMode.equals("EXECUTE")) {
 						p = Runtime.getRuntime().exec(cmdArray);
 					} else {						
-						debugStr = "test" + " --test-root " + "\"" + testRootPath.toString() + "\"" + " --logger-config " + "\"" + loggerConfigPath.toString() + "\"" + " --consolidator-config " + "\"" + consolidatorConfigPathInWorkDir + "\""  + " --core-path " + "\"" + corePath + "\""; 
+						debugStr = "test" + " --test-root " + "\"" + testRootPath.toString() + "\"" + " --logger-config " + "\"" + loggerConfigPath.toString() + "\"" + " --consolidator-config " + "\"" + consolidatorConfigPathInWorkDir + "\""  + " --core-path " + "\"" + corePath + "\"" + " --num-threads " + testNumThreadsStr; 
 					}
 				} else {				
 					String scriptName = "synclite-validator.sh";
@@ -335,12 +345,12 @@ public class ValidateJobConfiguration extends HttpServlet {
 						Files.setPosixFilePermissions(scriptPath, perms);
 					}
 
-					String[] cmdArray = {scriptPath.toString(), "test", "--test-root", testRootPath.toString(), "--logger-config", loggerConfigPath.toString(), "--consolidator-config", consolidatorConfigPathInWorkDir.toString(), "--core-path", corePath.toString()};
+					String[] cmdArray = {scriptPath.toString(), "test", "--test-root", testRootPath.toString(), "--logger-config", loggerConfigPath.toString(), "--consolidator-config", consolidatorConfigPathInWorkDir.toString(), "--core-path", corePath.toString(), "--num-threads", testNumThreadsStr};
 
 					if (executionMode.equals("EXECUTE")) {
 						p = Runtime.getRuntime().exec(cmdArray);
 					} else {
-						debugStr = "test" + " --test-root " + "\"" + testRootPath.toString() + "\"" + " --logger-config " + "\"" + loggerConfigPath.toString() + "\"" + " --consolidator-config " + "\"" + consolidatorConfigPathInWorkDir + "\""  + " --core-path " + "\"" + corePath + "\"";
+						debugStr = "test" + " --test-root " + "\"" + testRootPath.toString() + "\"" + " --logger-config " + "\"" + loggerConfigPath.toString() + "\"" + " --consolidator-config " + "\"" + consolidatorConfigPathInWorkDir + "\""  + " --core-path " + "\"" + corePath + "\"" + " --num-threads " + testNumThreadsStr ;
 					}
 				}
 
@@ -386,7 +396,7 @@ public class ValidateJobConfiguration extends HttpServlet {
 
 
 			request.getSession().setAttribute("test-root",testRoot); 
-			//request.getSession().setAttribute("device-upload-root", deviceUploadRoot); 
+			request.getSession().setAttribute("test-num-threads", testNumThreadsStr); 
 			request.getSession().setAttribute("logger-config",loggerConfig);
 			request.getSession().setAttribute("consolidator-config",consolidatorConfigPathInWorkDir);
 			request.getSession().setAttribute("job-status","STARTED");

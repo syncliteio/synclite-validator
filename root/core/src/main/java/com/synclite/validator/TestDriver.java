@@ -30,10 +30,16 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
@@ -56,11 +62,12 @@ public class TestDriver implements Runnable{
 	private Path loggerConfig;
 	private Path consolidatorConfig;
 	private Path corePath;
+	private Integer numThreads;
 	private PreparedStatement insertPstmtValidatorDB;
 	private PreparedStatement updatePstmtValidatorDB;
 	private Connection validatorDBConn;
-	private long lastTestStartTime;
-	private long lastTestFinishTime;
+	private ThreadLocal<Long> lastTestStartTime = new ThreadLocal<Long>();
+	private ThreadLocal<Long> lastTestFinishTime = new ThreadLocal<Long>();
 	private Logger globalTracer;
 	private HashMap<String, String> consolidatorConfigs = new HashMap<String, String>();
 	private DBReader dstDBReader;
@@ -71,7 +78,7 @@ public class TestDriver implements Runnable{
 	private static final Long CONSOLIDATION_CHECK_INTERVAL = 5000L;
 	private static final Long CONSOLIDATOR_JOB_WAIT_DURATION_MS = 300000L;
 
-	public TestDriver(Path testRoot, Path loggerConfig, Path consolidatorConfig, Path corePath) throws SyncLiteTestException {
+	public TestDriver(Path testRoot, Path loggerConfig, Path consolidatorConfig, Path corePath, Integer nThr) throws SyncLiteTestException {
 		this.testRoot = testRoot;
 		this.loggerConfig = loggerConfig;		
 		this.consolidatorConfig = consolidatorConfig;
@@ -80,6 +87,7 @@ public class TestDriver implements Runnable{
 		this.stageDir = testRoot.resolve("stageDir");
 		this.workDir = testRoot.resolve("workDir");
 		this.commandDir = testRoot.resolve("commandDir");
+		this.numThreads = nThr;
 		try {
 			initTracer();
 
@@ -314,8 +322,8 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-
-	public void runTests() throws SyncLiteTestException {
+/*
+	public void runTestsSerial() throws SyncLiteTestException {
 		createMockDevice();	
 		//Add test method calls here
 
@@ -362,6 +370,73 @@ public class TestDriver implements Runnable{
 		testSQLiteCallback();
 		testSQLiteReinitializeDevice();
 	}
+*/
+	
+	public void runTests() throws SyncLiteTestException, InterruptedException, ExecutionException {
+		createMockDevice();	
+		//Add test method calls here
+
+		 // List of test method references
+        List<Callable<Void>> testTasks = Arrays.asList(
+            () -> { testSQLiteStmtBasic(); return null; },
+            () -> { testSQLitePreparedStmtBasic(); return null; },
+            () -> { testSQLiteTableMerge(); return null; },
+            () -> { testSQLiteCommitRollback(); return null; },
+            () -> { testSQLiteFatTableAutoArgInlining(); return null; },
+            () -> { testSQLiteFatTableFixedInlinedArgs(); return null; },
+
+            () -> { testDuckDBStmtBasic(); return null; },
+            () -> { testDuckDBPreparedStmtBasic(); return null; },
+            () -> { testDuckDBCommitRollback(); return null; },
+            
+            () -> { testDerbyStmtBasic(); return null; },
+            () -> { testDerbyPreparedStmtBasic(); return null; },
+            () -> { testDerbyCommitRollback(); return null; },
+            
+            () -> { testH2StmtBasic(); return null; },
+            () -> { testH2PreparedStmtBasic(); return null; },
+            () -> { testH2CommitRollback(); return null; },
+            
+            () -> { testHyperSQLStmtBasic(); return null; },
+            () -> { testHyperSQLPreparedStmtBasic(); return null; },
+            () -> { testHyperSQLCommitRollback(); return null; },
+            
+            () -> { testTelemetryPreparedStmtBasic(); return null; },
+            () -> { testTelemetryFatTableAutoArgInlining(); return null; },
+            () -> { testTelemetryFatTableFixedInlinedArgs(); return null; },
+            () -> { testTelemetryInsertWithColList(); return null; },
+
+            () -> { testStreamingPreparedStmtBasic(); return null; },
+            
+            () -> { testSQLiteAppenderPreparedStmtBasic(); return null; },
+            () -> { testDuckDBAppenderPreparedStmtBasic(); return null; },
+            () -> { testDerbyAppenderPreparedStmtBasic(); return null; },
+            () -> { testH2AppenderPreparedStmtBasic(); return null; },
+            () -> { testHyperSQLAppenderPreparedStmtBasic(); return null; },
+            
+            () -> { testSQLiteAppenderFatTableAutoArgInlining(); return null; },
+            () -> { testSQLiteAppenderFatTableFixedInlinedArgs(); return null; },
+            () -> { testSQLiteAppenderInsertWithColList(); return null; },
+
+            () -> { testSQLiteCallback(); return null; }
+        );
+        
+        ExecutorService executorService = Executors.newFixedThreadPool(numThreads);
+
+        List<Future<Void>> futures = executorService.invokeAll(testTasks);
+
+        for (Future<Void> future : futures) {
+            future.get();  
+        }
+
+        // Shut down the executor
+        executorService.shutdown();        
+        
+        //Run tests which cannot be in parallel execution
+        
+        //The reinitialize test restarts consolidator process and hence it needs executed separately at the end.
+        testSQLiteReinitializeDevice();
+	}
 
 	private void createMockDevice() throws SyncLiteTestException {		
 		globalTracer.error("Testing mock device");
@@ -407,9 +482,9 @@ public class TestDriver implements Runnable{
 		globalTracer.addAppender(fa);
 	}
 
-	private final void preTest(String testName) throws SyncLiteTestException {		
+	private final synchronized void preTest(String testName) throws SyncLiteTestException {		
 		String startTimeStr = Instant.now().toString().replace("T", " ").replace("Z", "");
-		lastTestStartTime = System.currentTimeMillis();
+		lastTestStartTime.set(System.currentTimeMillis());
 		try {
 			insertPstmtValidatorDB.clearBatch();
 			insertPstmtValidatorDB.setString(1, testName);
@@ -424,10 +499,10 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-	private final void postTest(String testName, String executionStatus) throws SyncLiteTestException {		
+	private final synchronized void postTest(String testName, String executionStatus) throws SyncLiteTestException {		
 		String endTimeStr = Instant.now().toString().replace("T", " ").replace("Z", "");		
-		lastTestFinishTime = System.currentTimeMillis();
-		long testExecutionTime = lastTestFinishTime - lastTestStartTime;
+		lastTestFinishTime.set(System.currentTimeMillis());
+		long testExecutionTime = lastTestFinishTime.get() - lastTestStartTime.get();
 		try {
 			updatePstmtValidatorDB.clearBatch();
 			updatePstmtValidatorDB.setString(1, endTimeStr);

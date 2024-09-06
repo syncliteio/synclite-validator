@@ -52,6 +52,13 @@ if (request.getAttribute("test-root") != null) {
 	workDirPath = Path.of(System.getProperty("user.home"), "synclite", "test", "workDir");
 }
 
+Integer numThreads = 0;
+if (request.getAttribute("test-num-threads") != null) {
+	numThreads = Integer.valueOf(request.getAttribute("test-num-threads").toString());
+} else {
+	numThreads = Runtime.getRuntime().availableProcessors();
+}
+
 Path loggerConfig;
 if (request.getAttribute("logger-config") != null) {
 	loggerConfig = Path.of(request.getAttribute("logger-config").toString()); 
@@ -65,6 +72,7 @@ if (request.getAttribute("consolidator-config") != null) {
 } else {
 	consolidatorConfig = Path.of(getServletContext().getRealPath("/WEB-INF/lib"), "config", "consolidator", "DST-SQLITE_STAGE-FS_MODE-CONSOLIDATION.conf");
 }
+
 
 String executionMode;
 if (request.getAttribute("execution-mode") != null) {
@@ -153,6 +161,15 @@ try {
 							name="test-root"
 							value="<%=testRoot%>" readonly
 							title="Specify a work directory for SyncLite Validator."/>
+						</td>
+					</tr>
+
+					<tr>
+						<td>Number of Threads</td>
+						<td><input type="number" size=30 id="test-num-threads"
+							name="test-num-threads"
+							value="<%=numThreads%>" readonly
+							title="Specify number of threads to use for running tests."/>
 						</td>
 					</tr>
 					
