@@ -24,6 +24,6 @@
 			<attribute name="maven.pomderived" value="true"/>
 		</attributes>
 	</classpathentry>
-	<classpathentry kind="lib" path="C:/synclite/SyncLiteWorkspaces/SyncLiteDistributions/SyncLite/synclite-logger-java/logger/target/synclite-logger-2024.09.04.jar"/>
+	<classpathentry kind="lib" path="C:/synclite/SyncLiteWorkspaces/SyncLiteDistributions/SyncLite/synclite-logger-java/logger/target/synclite-logger-oss.jar"/>
 	<classpathentry kind="output" path="target/classes"/>
 </classpath>

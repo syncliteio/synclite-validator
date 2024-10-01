@@ -62,6 +62,16 @@
 										<include>native/*</include>										
 									</includes>
 								</resource>
+			
+								<resource>
+									<directory>${project.basedir}/../../../synclite-db/db/target</directory>
+									<includes>
+										<include>synclite-db-${revision}.jar</include>
+										<include>synclite-db.bat</include>
+										<include>synclite-db.sh</include>
+										<include>synclite_db.conf</include>
+									</includes>
+								</resource>
 							
 								<resource>
 									<directory>${project.basedir}/../core/target/validator</directory>

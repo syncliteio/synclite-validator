@@ -74,6 +74,34 @@ public class StopJob extends HttpServlet {
 		}
 
 		//
+		//Stop synclite-db
+		//
+		{
+			//Get current job PID if running
+			long currentJobPID = 0;
+			Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
+			BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+			String line = stdout.readLine();
+			while (line != null) {
+				if (line.contains("com.synclite.db.Main")) {
+					currentJobPID = Long.valueOf(line.split(" ")[0]);
+				}
+				line = stdout.readLine();
+			}
+			//stdout.close();
+
+			//Kill job if found
+
+			if(currentJobPID > 0) {
+				if (isWindows()) {
+					Runtime.getRuntime().exec("taskkill /F /PID " + currentJobPID);
+				} else {
+					Runtime.getRuntime().exec("kill -9 " + currentJobPID);
+				}
+			}
+		}
+
+		//
 		//Stop consolidator job
 		//
 		{
@@ -101,7 +129,8 @@ public class StopJob extends HttpServlet {
 			}
 		}
 		request.getSession().setAttribute("job-status","STOPPED");
-		request.getRequestDispatcher("dashboard.jsp").forward(request, response);
+		request.getSession().setAttribute("job-start-time", 0);
+		response.sendRedirect("dashboard.jsp");
 	}
 
 	/**
