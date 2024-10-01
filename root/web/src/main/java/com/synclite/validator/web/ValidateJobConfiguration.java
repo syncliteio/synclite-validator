@@ -283,6 +283,111 @@ public class ValidateJobConfiguration extends HttpServlet {
 					throw new ServletException("Failed to start consolidator job with exit value : " + p.exitValue());
 				}
 			}
+			
+			
+			Path syncLiteDBConfPath = Path.of(corePath, "synclite_db.conf");
+			confToReplace = new HashMap<String, String>();
+			confToReplace.put("trace-level", "DEBUG");
+			confToReplace.put("num-threads", "8");
+			addConfigValue(syncLiteDBConfPath, confToReplace);
+
+			//
+			//Start synclite-db job with default settings
+			//
+			{
+				//Get current job PID if running
+				long currentJobPID = 0;
+				Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
+				BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+				String line = stdout.readLine();
+				while (line != null) {
+					if (line.contains("com.synclite.db.Main")) {
+						currentJobPID = Long.valueOf(line.split(" ")[0]);
+					}
+					line = stdout.readLine();
+				}
+				//Kill job if found
+				if(currentJobPID > 0) {
+					if (isWindows()) {
+						Runtime.getRuntime().exec("taskkill /F /PID " + currentJobPID);
+					} else {
+						Runtime.getRuntime().exec("kill -9 " + currentJobPID);
+					}
+				}
+
+				//Start job again
+				Process p;
+				if (isWindows()) {
+					String scriptName = "synclite-db.bat";
+					String scriptPath = Path.of(corePath, scriptName).toString();
+					//String cmd = "\"" + scriptPath + "\"" + " sync " + " --work-dir " + "\"" + workDirPath + "\"" + " --config " + "\"" + consolidatorConfigPathInWorkDir + "\"";
+					String[] cmdArray = {scriptPath.toString(), "--config", syncLiteDBConfPath.toString()};
+					p = Runtime.getRuntime().exec(cmdArray);
+				} else {				
+					String scriptName = "synclite-db.sh";
+					Path scriptPath = Path.of(corePath, scriptName);
+
+					//First add execute permission				
+					/*
+					String [] command = {"/bin/chmod","+x", scriptPath};
+					Runtime rt = Runtime.getRuntime();
+					Process pr = rt.exec( command );
+					pr.waitFor();
+					 */
+
+					// Get the current set of script permissions
+					Set<PosixFilePermission> perms = Files.getPosixFilePermissions(scriptPath);
+					// Add the execute permission if it is not already set
+					if (!perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
+						perms.add(PosixFilePermission.OWNER_EXECUTE);
+						Files.setPosixFilePermissions(scriptPath, perms);
+					}
+
+					String[] cmdArray = {scriptPath.toString(), "--config", syncLiteDBConfPath.toString()};
+					p = Runtime.getRuntime().exec(cmdArray);
+				}
+
+				//int exitCode = p.exitValue();
+				//Thread.sleep(3000);
+				Thread.sleep(5000);
+				boolean processStatus = p.isAlive();
+				if (!processStatus) {
+					BufferedReader procErr = new BufferedReader(new InputStreamReader(p.getErrorStream()));
+					if ((line = procErr.readLine()) != null) {
+						StringBuilder errorMsg = new StringBuilder();
+						int i = 0;
+						do {
+							errorMsg.append(line);
+							errorMsg.append("\n");
+							line = procErr.readLine();
+							if (line == null) {
+								break;
+							}
+							++i;
+						} while (i < 5);
+						throw new ServletException("Failed to start synclite-db with exit code : " + p.exitValue() + " and errors : " + errorMsg.toString());
+					}
+
+					BufferedReader procOut = new BufferedReader(new InputStreamReader(p.getInputStream()));
+					if ((line = procOut.readLine()) != null) {
+						StringBuilder errorMsg = new StringBuilder();
+						int i = 0;
+						do {
+							errorMsg.append(line);
+							errorMsg.append("\n");
+							line = procOut.readLine();
+							if (line == null) {
+								break;
+							}
+							++i;
+						} while (i < 5);
+						throw new ServletException("Failed to start synclite-db with exit code : " + p.exitValue() + " and errors : " + errorMsg.toString());
+					}
+					throw new ServletException("Failed to start synclite-db with exit value : " + p.exitValue());
+				}
+			}
+			
+			
 			//
 			//Start validator core process by passing testRoot and loggerConfig
 			//
@@ -415,13 +520,13 @@ public class ValidateJobConfiguration extends HttpServlet {
 		}
 	}
 
-	private void replaceConfigValue(Path loggerConfigPath, HashMap<String, String> confToReplace) throws ServletException {
-		Path propsPath = loggerConfigPath;
+	private void replaceConfigValue(Path configPath, HashMap<String, String> confToReplace) throws ServletException {
+		Path propsPath = configPath;
 		HashMap<String, String> properties = new HashMap<String, String>();
 
 		BufferedReader reader = null;
 		try {
-			if (Files.exists(propsPath)) {		
+			if (Files.exists(propsPath)) {
 				reader = new BufferedReader(new FileReader(propsPath.toFile()));
 				String line = reader.readLine();
 				while (line != null) {
@@ -459,17 +564,35 @@ public class ValidateJobConfiguration extends HttpServlet {
 				propStr.append("\n");
 			}
 
-			Files.writeString(loggerConfigPath, propStr.toString(), StandardOpenOption.TRUNCATE_EXISTING);
+			Files.writeString(configPath, propStr.toString(), StandardOpenOption.TRUNCATE_EXISTING);
 
 		} catch (Exception e){ 
 			if (reader != null) {
 				try {
 					reader.close();
 				} catch (IOException e1) {
-					throw new ServletException("Failed to close config file", e1);
+					throw new ServletException("Failed to close config file : " + e1.getMessage(), e1);
 				}
 			}
-			throw new ServletException("Failed to replace config value in a config file " ,e);
+			throw new ServletException("Failed to replace config value in config file : " + e.getMessage() ,e);
+		}	
+	}
+
+	private void addConfigValue(Path configPath, HashMap<String, String> confToAdd) throws ServletException {
+		try {
+			//Write out contents of properties into the supplied config file.
+			StringBuilder propStr = new StringBuilder();
+			for (Map.Entry<String, String> entry : confToAdd.entrySet()) {
+				propStr.append(entry.getKey());
+				propStr.append("=");
+				propStr.append(entry.getValue());
+				propStr.append("\n");
+			}
+
+			Files.writeString(configPath, propStr.toString(), StandardOpenOption.TRUNCATE_EXISTING);
+
+		} catch (Exception e){ 
+			throw new ServletException("Failed to add config value in config file : " + e.getMessage() ,e);
 		}	
 	}
 

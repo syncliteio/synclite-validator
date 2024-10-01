@@ -168,7 +168,7 @@ try {
 						<td>Number of Threads</td>
 						<td><input type="number" size=30 id="test-num-threads"
 							name="test-num-threads"
-							value="<%=numThreads%>" readonly
+							value="<%=numThreads%>"
 							title="Specify number of threads to use for running tests."/>
 						</td>
 					</tr>

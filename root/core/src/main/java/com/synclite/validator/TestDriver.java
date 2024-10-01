@@ -32,6 +32,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
@@ -45,12 +46,19 @@ import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
 import org.apache.log4j.PatternLayout;
 import org.apache.log4j.RollingFileAppender;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
 import io.synclite.logger.*;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 
 public class TestDriver implements Runnable{
 
@@ -123,7 +131,7 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void stopConsolidatorJob() throws SyncLiteTestException {
-		globalTracer.info("Stopping consolidator job");
+		globalTracer.debug("Stopping consolidator job");
 		try {
 			long currentJobPID = getConsolidatorJobPID();
 			if(currentJobPID > 0) {
@@ -180,7 +188,7 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void startSyncConsolidatorJob() throws SyncLiteTestException {
-		globalTracer.info("Starting sync consolidator job");
+		globalTracer.debug("Starting sync consolidator job");
 		try {
 			String corePath = this.corePath.toString();
 			String deviceDataRoot = this.workDir.toString();
@@ -192,11 +200,11 @@ public class TestDriver implements Runnable{
 				String scriptPath = Path.of(corePath, scriptName).toString();
 				String[] cmdArray = {scriptPath, "sync", "--work-dir", deviceDataRoot, "--config", propsPath};
 				p = Runtime.getRuntime().exec(cmdArray);						
-				
+
 			} else {
 				String scriptName = "synclite-consolidator.sh";
 				Path scriptPath = Path.of(corePath, scriptName);
-				
+
 				// Get the current set of script permissions
 				Set<PosixFilePermission> perms = Files.getPosixFilePermissions(scriptPath);
 				// Add the execute permission if it is not already set
@@ -215,7 +223,7 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void startManageDevicesConsolidatorJob() throws SyncLiteTestException {
-		globalTracer.info("Starting manage devices consolidator job");
+		globalTracer.debug("Starting manage devices consolidator job");
 		try {
 			String corePath = this.corePath.toString();
 			String deviceDataRoot = this.workDir.toString();
@@ -228,11 +236,11 @@ public class TestDriver implements Runnable{
 				String scriptPath = Path.of(corePath, scriptName).toString();
 				String[] cmdArray = {scriptPath, "manage-devices", "--work-dir", deviceDataRoot, "--config", propsPath, "--manage-devices-config", manageDevicesPropsPath};
 				p = Runtime.getRuntime().exec(cmdArray);						
-				
+
 			} else {
 				String scriptName = "synclite-consolidator.sh";
 				Path scriptPath = Path.of(corePath, scriptName);
-				
+
 				String[] cmdArray = {scriptPath.toString(), "manage-devices", "--work-dir", deviceDataRoot, "--config", propsPath, "--manage-devices-config", manageDevicesPropsPath};
 				p = Runtime.getRuntime().exec(cmdArray);					
 			}
@@ -241,7 +249,7 @@ public class TestDriver implements Runnable{
 			throw new SyncLiteTestException("Failed to start manage-devices consolidator job : ", e);
 		}
 	}
-	
+
 	private final boolean isWindows() {
 		String osName = System.getProperty("os.name").toLowerCase();
 		if (osName.contains("win")) {
@@ -250,6 +258,67 @@ public class TestDriver implements Runnable{
 		return false;
 	}
 
+	private final void stopJobs() throws SyncLiteTestException {
+		//Stop synclite-db
+		try {
+			//
+			{
+				//Get current job PID if running
+				long currentJobPID = 0;
+				Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
+				BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+				String line = stdout.readLine();
+				while (line != null) {
+					if (line.contains("com.synclite.db.Main")) {
+						currentJobPID = Long.valueOf(line.split(" ")[0]);
+					}
+					line = stdout.readLine();
+				}
+				//stdout.close();
+
+				//Kill job if found
+
+				if(currentJobPID > 0) {
+					if (isWindows()) {
+						Runtime.getRuntime().exec("taskkill /F /PID " + currentJobPID);
+					} else {
+						Runtime.getRuntime().exec("kill -9 " + currentJobPID);
+					}
+				}
+			}
+
+			//
+			//Stop consolidator job
+			//
+			{
+				//Get current job PID if running
+				long currentJobPID = 0;
+				Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
+				BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+				String line = stdout.readLine();
+				while (line != null) {
+					if (line.contains("com.synclite.consolidator.Main")) {
+						currentJobPID = Long.valueOf(line.split(" ")[0]);
+					}
+					line = stdout.readLine();
+				}
+				//stdout.close();
+
+				//Kill job if found
+
+				if(currentJobPID > 0) {
+					if (isWindows()) {
+						Runtime.getRuntime().exec("taskkill /F /PID " + currentJobPID);
+					} else {
+						Runtime.getRuntime().exec("kill -9 " + currentJobPID);
+					}
+				}
+
+			}
+		} catch (Exception e) {
+			//Ignore
+		}
+	}
 	private void initDstDBReader(int dstIndex) {
 		DstType dstType = DstType.valueOf(consolidatorConfigs.get("dst-type-" + dstIndex));		
 		String dstConnStr = consolidatorConfigs.get("dst-connection-string-" + dstIndex);
@@ -322,7 +391,7 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-/*
+	/*
 	public void runTestsSerial() throws SyncLiteTestException {
 		createMockDevice();	
 		//Add test method calls here
@@ -356,7 +425,7 @@ public class TestDriver implements Runnable{
 		testTelemetryInsertWithColList();
 
 		testStreamingPreparedStmtBasic();
-	
+
 		testSQLiteAppenderPreparedStmtBasic();
 		testDuckDBAppenderPreparedStmtBasic();
 		testDerbyAppenderPreparedStmtBasic();
@@ -370,72 +439,85 @@ public class TestDriver implements Runnable{
 		testSQLiteCallback();
 		testSQLiteReinitializeDevice();
 	}
-*/
-	
+	 */
+
 	public void runTests() throws SyncLiteTestException, InterruptedException, ExecutionException {
 		createMockDevice();	
 		//Add test method calls here
 
-		 // List of test method references
-        List<Callable<Void>> testTasks = Arrays.asList(
-            () -> { testSQLiteStmtBasic(); return null; },
-            () -> { testSQLitePreparedStmtBasic(); return null; },
-            () -> { testSQLiteTableMerge(); return null; },
-            () -> { testSQLiteCommitRollback(); return null; },
-            () -> { testSQLiteFatTableAutoArgInlining(); return null; },
-            () -> { testSQLiteFatTableFixedInlinedArgs(); return null; },
+		// List of test method references
+		List<Callable<Void>> testTasks = Arrays.asList(
+				() -> { testSQLiteStmtBasic(); return null; },
+				() -> { testSQLitePreparedStmtBasic(); return null; },
+				() -> { testSQLiteTableMerge(); return null; },
+				() -> { testSQLiteCommitRollback(); return null; },
+				() -> { testSQLiteFatTableAutoArgInlining(); return null; },
+				() -> { testSQLiteFatTableFixedInlinedArgs(); return null; },
 
-            () -> { testDuckDBStmtBasic(); return null; },
-            () -> { testDuckDBPreparedStmtBasic(); return null; },
-            () -> { testDuckDBCommitRollback(); return null; },
-            
-            () -> { testDerbyStmtBasic(); return null; },
-            () -> { testDerbyPreparedStmtBasic(); return null; },
-            () -> { testDerbyCommitRollback(); return null; },
-            
-            () -> { testH2StmtBasic(); return null; },
-            () -> { testH2PreparedStmtBasic(); return null; },
-            () -> { testH2CommitRollback(); return null; },
-            
-            () -> { testHyperSQLStmtBasic(); return null; },
-            () -> { testHyperSQLPreparedStmtBasic(); return null; },
-            () -> { testHyperSQLCommitRollback(); return null; },
-            
-            () -> { testTelemetryPreparedStmtBasic(); return null; },
-            () -> { testTelemetryFatTableAutoArgInlining(); return null; },
-            () -> { testTelemetryFatTableFixedInlinedArgs(); return null; },
-            () -> { testTelemetryInsertWithColList(); return null; },
+				() -> { testDuckDBStmtBasic(); return null; },
+				() -> { testDuckDBPreparedStmtBasic(); return null; },
+				() -> { testDuckDBCommitRollback(); return null; },
 
-            () -> { testStreamingPreparedStmtBasic(); return null; },
-            
-            () -> { testSQLiteAppenderPreparedStmtBasic(); return null; },
-            () -> { testDuckDBAppenderPreparedStmtBasic(); return null; },
-            () -> { testDerbyAppenderPreparedStmtBasic(); return null; },
-            () -> { testH2AppenderPreparedStmtBasic(); return null; },
-            () -> { testHyperSQLAppenderPreparedStmtBasic(); return null; },
-            
-            () -> { testSQLiteAppenderFatTableAutoArgInlining(); return null; },
-            () -> { testSQLiteAppenderFatTableFixedInlinedArgs(); return null; },
-            () -> { testSQLiteAppenderInsertWithColList(); return null; },
+				() -> { testDerbyStmtBasic(); return null; },
+				() -> { testDerbyPreparedStmtBasic(); return null; },
+				() -> { testDerbyCommitRollback(); return null; },
 
-            () -> { testSQLiteCallback(); return null; }
-        );
-        
-        ExecutorService executorService = Executors.newFixedThreadPool(numThreads);
+				() -> { testH2StmtBasic(); return null; },
+				() -> { testH2PreparedStmtBasic(); return null; },
+				() -> { testH2CommitRollback(); return null; },
 
-        List<Future<Void>> futures = executorService.invokeAll(testTasks);
+				() -> { testHyperSQLStmtBasic(); return null; },
+				() -> { testHyperSQLPreparedStmtBasic(); return null; },
+				() -> { testHyperSQLCommitRollback(); return null; },
 
-        for (Future<Void> future : futures) {
-            future.get();  
-        }
+				() -> { testTelemetryPreparedStmtBasic(); return null; },
+				() -> { testTelemetryFatTableAutoArgInlining(); return null; },
+				() -> { testTelemetryFatTableFixedInlinedArgs(); return null; },
+				() -> { testTelemetryInsertWithColList(); return null; },
 
-        // Shut down the executor
-        executorService.shutdown();        
-        
-        //Run tests which cannot be in parallel execution
-        
-        //The reinitialize test restarts consolidator process and hence it needs executed separately at the end.
-        testSQLiteReinitializeDevice();
+				() -> { testStreamingPreparedStmtBasic(); return null; },
+
+				() -> { testSQLiteAppenderPreparedStmtBasic(); return null; },
+				() -> { testDuckDBAppenderPreparedStmtBasic(); return null; },
+				() -> { testDerbyAppenderPreparedStmtBasic(); return null; },
+				() -> { testH2AppenderPreparedStmtBasic(); return null; },
+				() -> { testHyperSQLAppenderPreparedStmtBasic(); return null; },
+
+				() -> { testSQLiteAppenderFatTableAutoArgInlining(); return null; },
+				() -> { testSQLiteAppenderFatTableFixedInlinedArgs(); return null; },
+				() -> { testSQLiteAppenderInsertWithColList(); return null; },
+				
+				() -> { testSQLiteCallback(); return null; },
+				
+				() -> { testSQLiteInSyncLiteDB(); return null; },
+				() -> { testDuckDBInSyncLiteDB(); return null; },
+				() -> { testH2InSyncLiteDB(); return null; },
+				() -> { testDerbyInSyncLiteDB(); return null; },
+				() -> { testHyperSQLInSyncLiteDB(); return null; },
+				() -> { testSQLiteAppenderInSyncLiteDB(); return null; },
+				() -> { testDuckDBAppenderInSyncLiteDB(); return null; },
+				() -> { testH2AppenderInSyncLiteDB(); return null; },
+				() -> { testDerbyAppenderInSyncLiteDB(); return null; },
+				() -> { testHyperSQLAppenderInSyncLiteDB(); return null; },
+				() -> { testStreamingInSyncLiteDB(); return null; }
+
+				);
+
+		ExecutorService executorService = Executors.newFixedThreadPool(numThreads);
+
+		List<Future<Void>> futures = executorService.invokeAll(testTasks);
+
+		for (Future<Void> future : futures) {
+			future.get();  
+		}
+
+		// Shut down the executor
+		executorService.shutdown();        
+
+		//Run tests which cannot be in parallel execution
+
+		//The reinitialize test restarts consolidator process and hence it needs executed separately at the end.
+		testSQLiteReinitializeDevice();
 	}
 
 	private void createMockDevice() throws SyncLiteTestException {		
@@ -471,11 +553,11 @@ public class TestDriver implements Runnable{
 
 	private final void initTracer() {
 		this.globalTracer = Logger.getLogger(TestDriver.class);    	
-		globalTracer.setLevel(Level.INFO);
+		globalTracer.setLevel(Level.DEBUG);
 		RollingFileAppender fa = new RollingFileAppender();
-		fa.setName("FileLogger");
+		fa.setName("SyncLiteValidatorTracer");
 		fa.setFile(workDir.resolve("synclite_validator.trace").toString());
-		fa.setLayout(new PatternLayout("%d %-5p [%c{1}] %m%n"));
+		fa.setLayout(new PatternLayout("%d %-5p [%c{1}] [%t] %m%n"));
 		fa.setMaxBackupIndex(10);
 		fa.setAppend(true);
 		fa.activateOptions();
@@ -493,7 +575,7 @@ public class TestDriver implements Runnable{
 			insertPstmtValidatorDB.setLong(4, 0);
 			insertPstmtValidatorDB.setString(5, "RUNNING");
 			insertPstmtValidatorDB.execute();
-			globalTracer.info("Started Test : " + testName);
+			globalTracer.debug("Started Test : " + testName);
 		} catch (SQLException e) {
 			throw new SyncLiteTestException("Failed to excecute test " + testName + " in preTest phase : ", e);
 		}
@@ -510,14 +592,14 @@ public class TestDriver implements Runnable{
 			updatePstmtValidatorDB.setString(3, executionStatus);
 			updatePstmtValidatorDB.setString(4, testName);
 			updatePstmtValidatorDB.execute();
-			globalTracer.info("Finished Test : " + testName);
+			globalTracer.debug("Finished Test : " + testName);
 		} catch (SQLException e) {
 			throw new SyncLiteTestException("Failed to excecute test " + testName + " in postTest phase : ", e);
 		}
 	}
 
 	private final void verifyDataWithDevice(String deviceName, DeviceType deviceType, Path devicePath, String tabName, List<String> cols, List<String> orderCols) throws SyncLiteTestException, InterruptedException {
-		globalTracer.info("Verifying data for table " + tabName + " in destination with respect to device :" + deviceName);
+		globalTracer.debug("Verifying data for table " + tabName + " in destination with respect to device :" + deviceName);
 
 		StringBuilder deviceSqlBuilder = new StringBuilder();
 		StringBuilder dstSqlBuilder = new StringBuilder();
@@ -562,7 +644,7 @@ public class TestDriver implements Runnable{
 			props.setProperty("duckdb.read_only", "true");
 			deviceDBReader = new DBReader(DstType.DUCKDB, "jdbc:duckdb:" + devicePath, props, this.globalTracer);
 		} else if (deviceType == DeviceType.DERBY || deviceType == DeviceType.DERBY_APPENDER) {
-	        props.setProperty("readonly", "true"); // Set read-only property
+			props.setProperty("readonly", "true"); // Set read-only property
 			deviceDBReader = new DBReader(DstType.DERBY, "jdbc:derby:" + devicePath, props, this.globalTracer);
 		} else if (deviceType == DeviceType.H2 || deviceType == DeviceType.H2_APPENDER) {
 			deviceDBReader = new DBReader(DstType.H2, "jdbc:h2:" + devicePath, props, this.globalTracer);
@@ -571,7 +653,7 @@ public class TestDriver implements Runnable{
 		} else {
 			deviceDBReader = new DBReader(DstType.SQLITE, "jdbc:sqlite:" + devicePath, props, this.globalTracer);
 		}
-		
+
 		List<String> deviceDataRows = deviceDBReader.readRows(deviceSqlBuilder.toString());
 		List<String> dstDataRows = dstDBReader.readRows(dstSqlBuilder.toString());
 
@@ -593,7 +675,7 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void verifyData(List<String> expectedRows, String tabName, List<String> cols, List<String> orderCols) throws SyncLiteTestException, InterruptedException {	
-		globalTracer.info("Verifying data for table :" + tabName);
+		globalTracer.debug("Verifying data for table :" + tabName);
 		StringBuilder dstSqlBuilder = new StringBuilder();
 		dstSqlBuilder.append("SELECT ");
 		boolean first = true;
@@ -643,19 +725,19 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void dumpRows(List<String> expectedRows, List<String> currentRows, String sql) {
-		globalTracer.info("Result verification dump for SQL : " + sql);
-		globalTracer.info("Expected Rows : ");
+		globalTracer.debug("Result verification dump for SQL : " + sql);
+		globalTracer.debug("Expected Rows : ");
 		for (String s : expectedRows) {
-			globalTracer.info(s);
+			globalTracer.debug(s);
 		}
-		globalTracer.info("Current Rows : ");
+		globalTracer.debug("Current Rows : ");
 		for (String s : currentRows) {
-			globalTracer.info(s);
+			globalTracer.debug(s);
 		}		
 	}
 
 	private final void waitForConsolidationStartup() throws SyncLiteTestException {
-		globalTracer.info("Waiting for data consolidation startup");
+		globalTracer.debug("Waiting for data consolidation startup");
 		//Read every 5 seconds for 5 minutes and then give up.
 		try {
 			long waited = 0;
@@ -663,7 +745,7 @@ public class TestDriver implements Runnable{
 				try {
 					String dstQuery = "SELECT commit_id FROM " + dstTablePrefix + "synclite_metadata";
 					dstDBReader.readScalarLong(dstQuery);
-					globalTracer.info("Verified Data Consolidation startup");
+					globalTracer.debug("Verified Data Consolidation startup");
 					return;
 				} catch (SyncLiteTestException e){
 					Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
@@ -677,7 +759,7 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void waitForConsolidation(String deviceName, DeviceType deviceType, Path devicePath) throws SyncLiteTestException {		
-		globalTracer.info("Waiting for data consolidation of the executed workload");
+		globalTracer.debug("Waiting for data consolidation of the executed workload");
 		//Read every 5 seconds for 5 minutes and then give up.
 		try {
 			long waited = 0;
@@ -690,7 +772,7 @@ public class TestDriver implements Runnable{
 					props.setProperty("duckdb.read_only", "true");
 					deviceDBReader = new DBReader(DstType.DUCKDB, "jdbc:duckdb:" + devicePath.toString(), props, this.globalTracer);
 				} else if (deviceType == DeviceType.DERBY || deviceType == DeviceType.DERBY_APPENDER) {
-			        props.setProperty("readonly", "true"); // Set read-only property
+					props.setProperty("readonly", "true"); // Set read-only property
 					deviceDBReader = new DBReader(DstType.DERBY, "jdbc:derby:" + devicePath.toString(), props, this.globalTracer);
 				} else if (deviceType == DeviceType.H2 || deviceType == DeviceType.H2_APPENDER) {
 					deviceDBReader = new DBReader(DstType.H2, "jdbc:h2:" + devicePath.toString(), props, this.globalTracer);
@@ -700,6 +782,50 @@ public class TestDriver implements Runnable{
 					deviceDBReader = new DBReader(DstType.SQLITE, "jdbc:sqlite:" + devicePath.toString(), props, this.globalTracer);
 				}
 				deviceCommitID = deviceDBReader.readScalarLong(DEVICE_COMMIT_ID_READER_QUERY);
+				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
+
+				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
+
+				if (deviceCommitID == dstCommitID) {
+					return;
+				} else {
+					Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
+					waited += CONSOLIDATION_CHECK_INTERVAL;
+				}
+			}
+			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);			
+		} catch (InterruptedException e) {
+			Thread.interrupted();
+		}
+	}
+
+	private final void waitForConsolidationOfSyncLiteDB(String deviceName, DeviceType deviceType, Path devicePath) throws SyncLiteTestException {		
+		globalTracer.debug("Waiting for data consolidation of the executed workload");
+		//Read every 5 seconds for 5 minutes and then give up.
+		try {
+			long waited = 0;
+			long deviceCommitID = 0;
+			long dstCommitID = 0;
+			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
+				try {
+					SyncLiteDBResult r = executeSQL(devicePath, null, DEVICE_COMMIT_ID_READER_QUERY, null);					
+					if (r.resultSet == null) {
+						globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + r.message);
+					} else if (r.resultSet.length() != 1) {
+						globalTracer.debug("max commit id is missing in SyncLiteDB");				
+					} else {					
+						JSONObject o = r.resultSet.getJSONObject(0);
+				        Iterator<String> keys = o.keys();
+				        if (keys.hasNext()) {
+				            String key = keys.next();
+				            deviceCommitID = o.getLong(key);
+				        }
+					}					
+				} catch (SQLException e) {
+					deviceCommitID = 0;
+					globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + e.getMessage() ,e);
+				}
+
 				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
 
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
@@ -770,7 +896,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -865,7 +991,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -943,7 +1069,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -1088,7 +1214,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -1207,7 +1333,7 @@ public class TestDriver implements Runnable{
 
 				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
-					
+
 					pstmt.execute();
 				}
 			}
@@ -1230,7 +1356,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -1376,12 +1502,12 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
 
-	
+
 	private final void testDerbyStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDerbyStmtBasic";
 
@@ -1495,7 +1621,7 @@ public class TestDriver implements Runnable{
 
 				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
-					
+
 					pstmt.execute();
 				}
 			}
@@ -1518,7 +1644,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -1664,12 +1790,12 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
 
-	
+
 	private final void testH2StmtBasic() throws SyncLiteTestException {		
 		String testName = "testH2StmtBasic";
 
@@ -1783,7 +1909,7 @@ public class TestDriver implements Runnable{
 
 				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
-					
+
 					pstmt.execute();
 				}
 			}
@@ -1806,7 +1932,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -1952,13 +2078,13 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
 
-	
-	
+
+
 	private final void testHyperSQLStmtBasic() throws SyncLiteTestException {		
 		String testName = "testHyperSQLStmtBasic";
 
@@ -2072,7 +2198,7 @@ public class TestDriver implements Runnable{
 
 				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tabHSQL WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
-					
+
 					pstmt.execute();
 				}
 			}
@@ -2095,7 +2221,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2241,7 +2367,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2331,7 +2457,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2421,7 +2547,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2499,7 +2625,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2567,7 +2693,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2635,7 +2761,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2703,7 +2829,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2771,7 +2897,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2863,7 +2989,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -2939,7 +3065,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -3061,7 +3187,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -3176,7 +3302,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -3268,7 +3394,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -3352,7 +3478,7 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
@@ -3373,6 +3499,7 @@ public class TestDriver implements Runnable{
 			Class.forName("io.synclite.logger.Telemetry");
 			Class.forName("io.synclite.logger.Streaming");
 			runTests();
+			stopJobs();
 		} catch (Exception e) {
 			globalTracer.error("ERROR : ", e);
 			System.out.println("ERROR : " + e);
@@ -3456,12 +3583,12 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
 
-	
+
 	private final void testSQLiteReinitializeDevice() throws SyncLiteTestException {		
 		String testName = "testSQLiteReinitializeDevice";
 
@@ -3493,7 +3620,7 @@ public class TestDriver implements Runnable{
 			}
 
 			waitForConsolidation(testName, DeviceType.SQLITE, testDBPath);
-			
+
 			List<String> cols = new ArrayList<String>();
 			cols.add("col1");
 			cols.add("col2");
@@ -3507,17 +3634,17 @@ public class TestDriver implements Runnable{
 
 			//Stop job			
 			stopConsolidatorJob();
-			
+
 			//Reinitialize the device
-			
+
 			createManageDevicesConfigFile(testName);
 
 			startManageDevicesConsolidatorJob();
-			
+
 			waitForConsolidatorJobToStop();
-			
+
 			startSyncConsolidatorJob();
-			
+
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
 					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5', '5')");
@@ -3533,14 +3660,14 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
 
 
 	private final void waitForConsolidatorJobToStop() throws SyncLiteTestException {
-		globalTracer.info("Waiting for consolidator job to stop");
+		globalTracer.debug("Waiting for consolidator job to stop");
 		//Read every 5 seconds for 5 minutes and then give up.
 		try {
 			long waited = 0;
@@ -3563,16 +3690,16 @@ public class TestDriver implements Runnable{
 
 
 	private final void createManageDevicesConfigFile(String deviceNamePattern) throws SyncLiteTestException {
-		globalTracer.info("Creating manage-devices job configuration file");
+		globalTracer.debug("Creating manage-devices job configuration file");
 		try {
 			StringBuilder builder = new StringBuilder();
-			
+
 			builder.append("manage-devices-operation-type = REINITIALIZE_DEVICES");
 			builder.append("\n");
 			builder.append("manage-devices-name-pattern = " + deviceNamePattern);
-			
+
 			Path manageDevicesPropsPath = Path.of(this.workDir.toString(), "synclite_consolidator_manage_devices.conf");
-	
+
 			Files.writeString(manageDevicesPropsPath, builder.toString());
 		} catch (Exception e) {
 			throw new SyncLiteTestException("Failed to write manage devices config file ", e);
@@ -3634,7 +3761,7 @@ public class TestDriver implements Runnable{
 					pstmt.setString(3, "3");;
 					pstmt.setBytes(4, "3".getBytes());
 					pstmt.setInt(5, 3);
-				
+
 					pstmt.addBatch();
 
 					pstmt.setDouble(1, 4.4);
@@ -3642,7 +3769,7 @@ public class TestDriver implements Runnable{
 					pstmt.setString(3, "4");
 					pstmt.setBytes(4, "4".getBytes());
 					pstmt.setInt(5, 4);
-					
+
 					pstmt.addBatch();
 
 					pstmt.executeBatch();
@@ -3680,12 +3807,12 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
 	}
 
-	
+
 	private final void testSQLiteAppenderInsertWithColList() throws SyncLiteTestException {		
 		String testName = "testSQLiteAppenderInsertWithColList";
 		String tabName = "testSQLiteAppenderInsertWithColList";
@@ -3724,7 +3851,7 @@ public class TestDriver implements Runnable{
 					pstmt.setString(3, "3");;
 					pstmt.setBytes(4, "3".getBytes());
 					pstmt.setInt(5, 3);
-				
+
 					pstmt.addBatch();
 
 					pstmt.setDouble(1, 4.4);
@@ -3732,7 +3859,7 @@ public class TestDriver implements Runnable{
 					pstmt.setString(3, "4");
 					pstmt.setBytes(4, "4".getBytes());
 					pstmt.setInt(5, 4);
-					
+
 					pstmt.addBatch();
 
 					pstmt.executeBatch();
@@ -3770,9 +3897,458 @@ public class TestDriver implements Runnable{
 			postTest(testName, "PASS");
 		} catch (Exception e) {
 			globalTracer.error("Failed Test : " + testName);
-			globalTracer.error("Details : ", e);
+			globalTracer.error("Details : " + e.getMessage(),  e);
 			postTest(testName, "FAIL");
 		}
+	}
+
+	private void testSQLiteInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testSQLiteInSyncLiteDB", DeviceType.SQLITE);
+	}
+
+	private void testDuckDBInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testDuckDBInSyncLiteDB", DeviceType.DUCKDB);
+	}
+
+	private void testH2InSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testH2InSyncLiteDB", DeviceType.H2);
+	}
+
+	private void testDerbyInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testDerbyInSyncLiteDB", DeviceType.DERBY);
+	}
+
+	private void testHyperSQLInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testHyperSQLInSyncLiteDB", DeviceType.HYPERSQL);
+	}
+
+	private void testSQLiteAppenderInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testSQLiteAppenderInSyncLiteDB", DeviceType.SQLITE_APPENDER);
+	}
+
+	private void testDuckDBAppenderInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testDuckDBAppenderInSyncLiteDB", DeviceType.DUCKDB_APPENDER);
+	}
+
+	private void testH2AppenderInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testH2AppenderInSyncLiteDB", DeviceType.H2_APPENDER);
+	}
+
+	private void testDerbyAppenderInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testDerbyAppenderInSyncLiteDB", DeviceType.DERBY_APPENDER);
+	}
+
+	private void testHyperSQLAppenderInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testHyperSQLAppenderInSyncLiteDB", DeviceType.HYPERSQL_APPENDER);
+	}
+
+	private void testStreamingInSyncLiteDB() throws SyncLiteTestException {
+		testSyncLiteDB("testStreamingInSyncLiteDB", DeviceType.STREAMING);
+	}
+
+	private void testSyncLiteDB(String testName, DeviceType deviceType) throws SyncLiteTestException {
+		Path testDBPath = dbDir.resolve(testName + ".db");
+		try {			
+			preTest(testName);
+			//Initialize DB
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting initialize DB"); 
+			globalTracer.debug("========================================================");
+			SyncLiteDBResult r = initializeDB(testDBPath, deviceType.toString(), testName, loggerConfig);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute initialize db operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+
+			//Start a transaction
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting begin transaction"); 
+			globalTracer.debug("========================================================");
+			r = beginTransaction(testDBPath);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			globalTracer.debug("txn-handle: " + r.txnHandle);
+			String txnHandle = r.txnHandle;
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute begin transaction operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+			//Create a Table
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting create table"); 
+			globalTracer.debug("========================================================");
+			r = executeSQL(testDBPath, txnHandle, "create table "  + testName + "(a int, b varchar(50))", null);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute create table operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+			//Insert Data in a table
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting insert into table inside transaction"); 
+			globalTracer.debug("========================================================");
+			JSONArray arguments = new JSONArray();
+			JSONArray rec1= new JSONArray();
+			rec1.put(1);
+			rec1.put("one");
+
+			JSONArray rec2= new JSONArray();
+			rec2.put(2);
+			rec2.put("two");
+
+			arguments.put(rec1);
+			arguments.put(rec2);
+
+			r = executeSQL(testDBPath, txnHandle, "insert into " + testName + "(a,b) values(?, ?)", arguments);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute insert into table operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+			//Commit Transaction
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting commit transaction"); 
+			globalTracer.debug("========================================================");
+			r = commitTransaction(testDBPath, txnHandle);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute commit transaction operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+
+			//Insert Data in a table
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting insert into table"); 
+			globalTracer.debug("========================================================");
+			arguments = new JSONArray();
+			rec1= new JSONArray();
+			rec1.put(3);
+			rec1.put("three");
+
+			rec2= new JSONArray();
+			rec2.put(4);
+			rec2.put("four");
+
+			arguments.put(rec1);
+			arguments.put(rec2);
+
+			r = executeSQL(testDBPath, null, "insert into " + testName + "(a,b) values(?, ?)", arguments);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute insert into table operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+
+			//Start a transaction
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting begin transaction"); 
+			globalTracer.debug("========================================================");
+			r = beginTransaction(testDBPath);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			globalTracer.debug("txn-handle: " + r.txnHandle);
+			txnHandle = r.txnHandle;
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute begin transaction operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+			//Insert Data in a table
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting insert into table inside transaction"); 
+			globalTracer.debug("========================================================");
+			arguments = new JSONArray();
+			rec1= new JSONArray();
+			rec1.put(5);
+			rec1.put("five");
+
+			arguments.put(rec1);
+
+			r = executeSQL(testDBPath, txnHandle, "insert into " + testName + "(a,b) values(?, ?)", arguments);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute insert into table operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+			//Rollback Transaction
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting rollback transaction"); 
+			globalTracer.debug("========================================================");
+			r = rollbackTransaction(testDBPath, txnHandle);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute rollback transaction operation : " + r.message);
+			}
+			globalTracer.debug("========================================================");
+
+			if (deviceType != DeviceType.STREAMING) {
+				//Select from table
+				globalTracer.debug("========================================================");
+				globalTracer.debug("Excecuting select from table"); 
+				globalTracer.debug("========================================================");
+				r = executeSQL(testDBPath, null, "select a, b from " + testName, null);
+				globalTracer.debug("result : " + r.result);
+				globalTracer.debug("message : " + r.message);
+
+				if (r.result == false) {
+					throw new SyncLiteTestException("Failed to execute select from table operation : " + r.message);
+				}
+
+				JSONArray resultSet = r.resultSet;
+
+				if (resultSet.length() != 4) {
+					throw new SyncLiteTestException("Expected resultset count : 4, received : " + resultSet.length() + " : " + resultSet.toString());
+				}
+
+				globalTracer.debug("========================================================");
+			}
+			
+			//Now wait for consolidation and validate results
+			waitForConsolidationOfSyncLiteDB(testName, deviceType, testDBPath);
+
+			//Close DB
+			globalTracer.debug("========================================================");
+			globalTracer.debug("Excecuting close DB"); 
+			globalTracer.debug("========================================================");
+			r = closeDB(testDBPath);
+			globalTracer.debug("result : " + r.result);
+			globalTracer.debug("message : " + r.message);
+			globalTracer.debug("========================================================");
+
+			if (r.result == false) {
+				throw new SyncLiteTestException("Failed to execute close db operation : " + r.message);
+			}
+
+
+			List<String> cols = new ArrayList<String>();
+			cols.add("a");
+			cols.add("b");
+
+			List<String> orderCols = new ArrayList<String>();
+			orderCols.add("a");
+			orderCols.add("b");
+
+			List<String> expectedRows = new ArrayList<String>();
+			expectedRows.add("1|one");
+			expectedRows.add("2|two");
+			expectedRows.add("3|three");
+			expectedRows.add("4|four");
+
+			verifyData(expectedRows, testName, cols, orderCols);
+
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			postTest(testName, "FAIL");
+		}
+	}
+
+	public static class SyncLiteDBResult {
+		public boolean result;
+		public String message;
+		public JSONArray resultSet;
+		public String txnHandle;
+	}
+
+	private static String syncLiteDBAddress = "http://localhost:5555";
+
+	public JSONObject processRequest(JSONObject jsonRequest) throws SQLException {
+		JSONObject jsonResponse = null;
+		try {
+			URL url = new URL(syncLiteDBAddress);
+
+			HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+
+			// Set up connection properties
+			conn.setRequestMethod("POST");
+			conn.setRequestProperty("Content-Type", "application/json"); // Set content type as JSON
+			conn.setDoOutput(true);
+			conn.setConnectTimeout(1000000);
+			conn.setReadTimeout(1000000);
+
+			globalTracer.debug("Request JSON: " + jsonRequest.toString(4)); // Pretty print with 4 spaces
+
+			// Send the JSON request
+			try (OutputStream os = conn.getOutputStream()) {
+				byte[] input = jsonRequest.toString().getBytes("utf-8");
+				os.write(input, 0, input.length);
+			}
+			
+
+			// Get the response code
+			int responseCode = conn.getResponseCode();
+			globalTracer.debug("Response Code: " + responseCode);
+
+			// If the response code is 200 OK, read the response
+			if (responseCode == HttpURLConnection.HTTP_OK) {
+				BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+				String inputLine;
+				StringBuilder response = new StringBuilder();
+
+				while ((inputLine = in.readLine()) != null) {
+					response.append(inputLine);
+				}
+				in.close();
+
+				// Parse the response JSON and print it
+				jsonResponse = new JSONObject(response.toString());
+				globalTracer.debug("Response JSON: " + jsonResponse.toString(4)); // Pretty print with 4 spaces
+
+				// Access specific fields in the response JSON
+				boolean result = jsonResponse.getBoolean("result");
+				String message = jsonResponse.getString("message");
+
+				globalTracer.debug("Result: " + result);
+				globalTracer.debug("Message: " + message);
+			} else {
+				throw new SQLException("Failed to get a valid response from the server : " + responseCode);
+			}	
+		} catch (Exception e) {
+			throw new SQLException("Failed to process request : " + e.getMessage(), e);
+		}
+		return jsonResponse;
+	}
+
+	public SyncLiteDBResult initializeDB(Path dbPath, String dbType, String dbName, Path syncLiteLoggerConfigPath) throws SQLException{
+		SyncLiteDBResult dbResult;
+		try {
+			JSONObject jsonRequest = new JSONObject();
+			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("db-type", dbType);
+			jsonRequest.put("db-name", dbName);
+			if (syncLiteLoggerConfigPath != null) {
+				jsonRequest.put("synclite-logger-config", syncLiteLoggerConfigPath);
+			}
+			jsonRequest.put("sql", "initialize");
+
+			JSONObject jsonRespose = processRequest(jsonRequest);
+
+			dbResult = new SyncLiteDBResult();
+			dbResult.result = jsonRespose.getBoolean("result");
+			dbResult.message = jsonRespose.getString("message");
+		} catch (Exception e) {
+			throw new SQLException("Failed to initialize DB : " + dbPath + " : " + e.getMessage(), e);
+		}
+		return dbResult;
+	}
+
+	public SyncLiteDBResult beginTransaction(Path dbPath) throws SQLException {
+		SyncLiteDBResult dbResult;
+		try {
+			JSONObject jsonRequest = new JSONObject();
+			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("sql", "begin");
+
+			JSONObject jsonRespose = processRequest(jsonRequest);
+
+			dbResult = new SyncLiteDBResult();
+			dbResult.result = jsonRespose.getBoolean("result");
+			dbResult.message = jsonRespose.getString("message");
+			dbResult.txnHandle = jsonRespose.getString("txn-handle");
+		} catch (Exception e) {
+			throw new SQLException("Failed to begin transaction on DB : " + dbPath + " : " + e.getMessage(), e);
+		}
+		return dbResult;
+	}
+
+	public SyncLiteDBResult commitTransaction(Path dbPath, String txnHandle) throws SQLException {
+		SyncLiteDBResult dbResult;
+		try {
+			JSONObject jsonRequest = new JSONObject();
+			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("txn-handle", txnHandle);
+			jsonRequest.put("sql", "commit");
+
+			JSONObject jsonRespose = processRequest(jsonRequest);
+
+			dbResult = new SyncLiteDBResult();
+			dbResult.result = jsonRespose.getBoolean("result");
+			dbResult.message = jsonRespose.getString("message");
+		} catch (Exception e) {
+			throw new SQLException("Failed to commit transaction on DB : " + dbPath + " : " + e.getMessage(), e);
+		}
+		return dbResult;
+	}
+
+	public SyncLiteDBResult rollbackTransaction(Path dbPath, String txnHandle) throws SQLException {
+		SyncLiteDBResult dbResult;
+		try {
+			JSONObject jsonRequest = new JSONObject();
+			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("sql", "rollback");
+			jsonRequest.put("txn-handle", txnHandle);
+
+			JSONObject jsonRespose = processRequest(jsonRequest);
+
+			dbResult = new SyncLiteDBResult();
+			dbResult.result = jsonRespose.getBoolean("result");
+			dbResult.message = jsonRespose.getString("message");
+		} catch (Exception e) {
+			throw new SQLException("Failed to rollback transaction on DB : " + dbPath + " : " + e.getMessage(), e);
+		}
+		return dbResult;
+	}
+
+	public SyncLiteDBResult executeSQL(Path dbPath, String txnHandle, String sql, JSONArray arguments) throws SQLException {
+		SyncLiteDBResult dbResult;
+		try {
+			JSONObject jsonRequest = new JSONObject();
+			jsonRequest.put("db-path", dbPath);			
+			jsonRequest.put("sql", sql);
+			if (txnHandle != null) {
+				jsonRequest.put("txn-handle", txnHandle);
+			}
+			if (arguments != null) {
+				jsonRequest.put("arguments", arguments);
+			}
+
+			JSONObject jsonResponse = processRequest(jsonRequest);
+
+			dbResult = new SyncLiteDBResult();
+			dbResult.result = jsonResponse.getBoolean("result");
+			dbResult.message = jsonResponse.getString("message");
+			if (jsonResponse.has("resultset")) {
+				dbResult.resultSet = jsonResponse.getJSONArray("resultset");
+			}
+		} catch (Exception e) {
+			throw new SQLException("Failed to execute sql on DB : " + dbPath + " : " + e.getMessage(), e);
+		}
+		return dbResult;
+	}
+
+	public SyncLiteDBResult closeDB(Path dbPath) throws SQLException {
+		SyncLiteDBResult dbResult;
+		try {
+			JSONObject jsonRequest = new JSONObject();
+			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("sql", "close");
+
+			JSONObject jsonRespose = processRequest(jsonRequest);
+
+			dbResult = new SyncLiteDBResult();
+			dbResult.result = jsonRespose.getBoolean("result");
+			dbResult.message = jsonRespose.getString("message");
+		} catch (Exception e) {
+			throw new SQLException("Failed to close DB : " + dbPath + " : " + e.getMessage(), e);
+		}
+		return dbResult;
 	}
 
 }
