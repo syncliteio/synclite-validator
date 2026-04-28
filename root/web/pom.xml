@@ -62,6 +62,15 @@
 										<include>native/*</include>										
 									</includes>
 								</resource>
+
+								<resource>
+									<directory>${project.basedir}/../../../synclite-dbreader/root/core/target/dbreader</directory>
+									<includes>
+										<include>synclite-dbreader.jar</include>
+										<include>synclite-dbreader.bat</include>
+										<include>synclite-dbreader.sh</include>
+									</includes>
+								</resource>
 			
 								<resource>
 									<directory>${project.basedir}/../../../synclite-db/db/target</directory>
@@ -133,7 +142,7 @@
 		<dependency>
 			<groupId>org.xerial</groupId>
 			<artifactId>sqlite-jdbc</artifactId>
-			<version>3.43.0.0</version>
+			<version>3.53.0.0</version>
 		</dependency>
 
 		<dependency>
