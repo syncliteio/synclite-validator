@@ -24,8 +24,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
@@ -258,6 +260,72 @@ public class TestDriver implements Runnable{
 		return false;
 	}
 
+	private final long getDBReaderJobPID() throws SyncLiteTestException {
+		try {
+			long currentJobPID = 0;
+			String javaHome = System.getenv("JAVA_HOME");
+			String jpsExe = (javaHome != null)
+					? javaHome + (isWindows() ? "\\bin\\jps" : "/bin/jps")
+					: "jps";
+			String[] cmdArray = {jpsExe, "-l", "-m"};
+			Process jpsProc = Runtime.getRuntime().exec(cmdArray);
+			BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+			String line = stdout.readLine();
+			while (line != null) {
+				if (line.contains("com.synclite.dbreader.Main")) {
+					try {
+						currentJobPID = Long.valueOf(line.split(" ")[0]);
+					} catch (NumberFormatException ignored) {}
+				}
+				line = stdout.readLine();
+			}
+			return currentJobPID;
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to get dbreader job PID : ", e);
+		}
+	}
+
+	private final void startDBReaderJob(Path dbDir, Path config) throws SyncLiteTestException {
+		globalTracer.debug("Starting dbreader job");
+		try {
+			String corePathStr = this.corePath.toString();
+			if (isWindows()) {
+				String scriptPath = Path.of(corePathStr, "synclite-dbreader.bat").toString();
+				String[] cmdArray = {scriptPath, "read", "--db-dir", dbDir.toString(), "--config", config.toString()};
+				Runtime.getRuntime().exec(cmdArray);
+			} else {
+				Path scriptPath = Path.of(corePathStr, "synclite-dbreader.sh");
+				Set<PosixFilePermission> perms = Files.getPosixFilePermissions(scriptPath);
+				if (!perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
+					perms.add(PosixFilePermission.OWNER_EXECUTE);
+					Files.setPosixFilePermissions(scriptPath, perms);
+				}
+				String[] cmdArray = {scriptPath.toString(), "read", "--db-dir", dbDir.toString(), "--config", config.toString()};
+				Runtime.getRuntime().exec(cmdArray);
+			}
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to start dbreader job : ", e);
+		}
+	}
+
+	private final void stopDBReaderJob() throws SyncLiteTestException {
+		globalTracer.debug("Stopping dbreader job");
+		try {
+			long currentJobPID = getDBReaderJobPID();
+			if (currentJobPID > 0) {
+				if (isWindows()) {
+					String[] cmdArray = {"taskkill", "/F", "/PID", String.valueOf(currentJobPID)};
+					Runtime.getRuntime().exec(cmdArray);
+				} else {
+					String[] cmdArray = {"kill", "-9", String.valueOf(currentJobPID)};
+					Runtime.getRuntime().exec(cmdArray);
+				}
+			}
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to stop dbreader job : ", e);
+		}
+	}
+
 	private final void stopJobs() throws SyncLiteTestException {
 		//Stop synclite-db
 		try {
@@ -360,7 +428,7 @@ public class TestDriver implements Runnable{
 				}			
 			}		
 		} else {
-			//TODO Handle REPLICATION mode
+			this.dstTablePrefix = "";
 		}
 	}
 
@@ -499,7 +567,8 @@ public class TestDriver implements Runnable{
 				() -> { testH2AppenderInSyncLiteDB(); return null; },
 				() -> { testDerbyAppenderInSyncLiteDB(); return null; },
 				() -> { testHyperSQLAppenderInSyncLiteDB(); return null; },
-				() -> { testStreamingInSyncLiteDB(); return null; }
+				() -> { testStreamingInSyncLiteDB(); return null; },
+				() -> { testDBReaderReplication(); return null; }
 
 				);
 
@@ -838,6 +907,102 @@ public class TestDriver implements Runnable{
 				}
 			}
 			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);			
+		} catch (InterruptedException e) {
+			Thread.interrupted();
+		}
+	}
+
+	//=================================================
+	//
+	// Reads column definitions from JDBC metadata in the JSON format that
+	// dbreader's DBMetadataReader.readSrcSchema() produces.  This prevents
+	// false schema-drift detection on startup.
+	// Format: ["col1 TYPE1 NULL", "col2 TYPE2 NOT NULL", ...]
+	//
+	private final String readJdbcSchemaAsJson(Connection conn, String tableName) throws Exception {
+		DatabaseMetaData meta = conn.getMetaData();
+		StringBuilder sb = new StringBuilder("[");
+		boolean first = true;
+		try (ResultSet cols = meta.getColumns(null, null, tableName, null)) {
+			while (cols.next()) {
+				String colName    = cols.getString("COLUMN_NAME");
+				String typeName   = cols.getString("TYPE_NAME").toUpperCase();
+				int    colSize    = cols.getInt("COLUMN_SIZE");
+				int    decDigits  = cols.getInt("DECIMAL_DIGITS");
+				String isNullable = cols.getString("IS_NULLABLE");
+
+				StringBuilder typeBldr = new StringBuilder(typeName);
+				if (typeName.equals("DECIMAL") && colSize > 0) {
+					typeBldr.append("(").append(colSize);
+					if (decDigits > 0) typeBldr.append(", ").append(decDigits);
+					typeBldr.append(")");
+				} else if ((typeName.equals("VARCHAR") || typeName.equals("CHAR") ||
+						typeName.equals("NCHAR") || typeName.equals("NVARCHAR")) && colSize > 0) {
+					typeBldr.append("(").append(colSize).append(")");
+				}
+				String nullable = (isNullable.equalsIgnoreCase("NO") ||
+						isNullable.equalsIgnoreCase("N")  ||
+						isNullable.equals("0")            ||
+						isNullable.equalsIgnoreCase("FALSE") ||
+						isNullable.equalsIgnoreCase("NOT NULL"))
+						? "NOT NULL" : "NULL";
+				typeBldr.append(" ").append(nullable);
+
+				if (!first) sb.append(", ");
+				first = false;
+				sb.append("\"").append(colName).append(" ").append(typeBldr).append("\"");
+			}
+		}
+		sb.append("]");
+		return sb.toString();
+	}
+
+	private final void waitForDbreaderReplicationRowCount(String table, long expected) throws SyncLiteTestException {
+		globalTracer.debug("Waiting for dbreader replication row count (" + expected + ") for table: " + table);
+		try {
+			long waited = 0;
+			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
+				try {
+					long count = dstDBReader.readScalarLong("SELECT COUNT(*) FROM " + this.dstTablePrefix + table);
+					if (count == expected) {
+						globalTracer.debug("Verified row count " + expected + " for table: " + table);
+						return;
+					}
+				} catch (SyncLiteTestException e) {
+					// table may not exist yet in destination
+				}
+				Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
+				waited += CONSOLIDATION_CHECK_INTERVAL;
+			}
+			long actual = -1;
+			try {
+				actual = dstDBReader.readScalarLong("SELECT COUNT(*) FROM " + this.dstTablePrefix + table);
+			} catch (Exception ignored) {}
+			throw new SyncLiteTestException("Timed out waiting for " + expected + " rows in " + table + "; actual=" + actual);
+		} catch (InterruptedException e) {
+			Thread.interrupted();
+		}
+	}
+
+	private final void waitForDbreaderReplicationValue(String table, String column, String idValue, String expected) throws SyncLiteTestException {
+		globalTracer.debug("Waiting for dbreader replication value '" + expected + "' in " + table + "." + column + " WHERE id=" + idValue);
+		try {
+			long waited = 0;
+			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
+				try {
+					List<String> rows = dstDBReader.readRows(
+							"SELECT " + column + " FROM " + this.dstTablePrefix + table + " WHERE id = " + idValue);
+					if (!rows.isEmpty() && expected.equals(rows.get(0))) {
+						globalTracer.debug("Verified value '" + expected + "' in " + table + "." + column);
+						return;
+					}
+				} catch (SyncLiteTestException e) {
+					// table may not exist yet
+				}
+				Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
+				waited += CONSOLIDATION_CHECK_INTERVAL;
+			}
+			throw new SyncLiteTestException("Timed out waiting for value '" + expected + "' in " + table + "." + column + " WHERE id=" + idValue);
 		} catch (InterruptedException e) {
 			Thread.interrupted();
 		}
@@ -3588,6 +3753,198 @@ public class TestDriver implements Runnable{
 		}
 	}
 
+
+	private final void testDBReaderReplication() throws SyncLiteTestException {
+		String testName = "testDBReaderReplication";
+		String fatTable = "fat_table";
+
+		// Skip if dbreader script is not deployed alongside consolidator
+		Path dbreaderScript = this.corePath.resolve(isWindows() ? "synclite-dbreader.bat" : "synclite-dbreader.sh");
+		if (!Files.exists(dbreaderScript)) {
+			globalTracer.debug("Skipping " + testName + ": dbreader script not found at " + dbreaderScript);
+			return;
+		}
+
+		Path dbreaderTestRoot   = this.workDir.resolve("dbreader_test");
+		Path dbreaderDbDir      = dbreaderTestRoot.resolve("db");
+		Path dbreaderSrcDbDir   = dbreaderTestRoot.resolve("srcDb");
+		Path dbreaderSrcDbPath  = dbreaderSrcDbDir.resolve("source.db");
+		Path dbreaderConfigPath = dbreaderDbDir.resolve("synclite_dbreader.conf");
+		Path dbreaderMetaDbPath = dbreaderDbDir.resolve("synclite_dbreader_metadata.db");
+		Path dbreaderLoggerConf = dbreaderDbDir.resolve("synclite_logger.conf");
+
+		try {
+			preTest(testName);
+
+			// ── directory layout ─────────────────────────────────────────────
+			Files.createDirectories(dbreaderDbDir);
+			Files.createDirectories(dbreaderSrcDbDir);
+
+			// ── source SQLite: fat_table ─────────────────────────────────────
+			// Covers all SQLite data-type categories.  is_deleted + updated_at
+			// drive incremental tracking and soft-delete detection.
+			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
+					Statement stmt = conn.createStatement()) {
+				stmt.execute(
+					"CREATE TABLE " + fatTable + " (" +
+					"id INTEGER PRIMARY KEY, " +
+					"col_text TEXT, " +
+					"col_varchar VARCHAR(100), " +
+					"col_int INTEGER, " +
+					"col_smallint SMALLINT, " +
+					"col_bigint BIGINT, " +
+					"col_real REAL, " +
+					"col_double DOUBLE, " +
+					"col_float FLOAT, " +
+					"col_numeric NUMERIC(10,2), " +
+					"col_decimal DECIMAL(8,4), " +
+					"col_boolean BOOLEAN, " +
+					"col_date DATE, " +
+					"col_datetime DATETIME, " +
+					"col_timestamp TIMESTAMP, " +
+					"col_blob BLOB, " +
+					"col_clob CLOB, " +
+					"is_deleted INTEGER DEFAULT 0, " +
+					"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
+				// Row 1 — kept unchanged through the test
+				stmt.execute(
+					"INSERT INTO " + fatTable + " VALUES(" +
+					"1,'hello','varchar_1',10,2,9000000000,1.1,2.2,3.3,12.34,56.78," +
+					"1,'2025-01-01','2025-01-01 10:00:00','2025-01-01 10:00:00'," +
+					"X'DEADBEEF','clob1',0,'2025-01-01 00:00:01')");
+				// Row 2 — will be UPDATE-d in Phase 2
+				stmt.execute(
+					"INSERT INTO " + fatTable + " VALUES(" +
+					"2,'world','varchar_2',20,4,8000000000,4.4,5.5,6.6,78.90,12.34," +
+					"0,'2025-02-01','2025-02-01 11:00:00','2025-02-01 11:00:00'," +
+					"X'CAFEBABE','clob2',0,'2025-01-01 00:00:02')");
+				// Row 3 — will be soft-DELETE-d in Phase 3
+				stmt.execute(
+					"INSERT INTO " + fatTable + " VALUES(" +
+					"3,'test','varchar_3',30,6,7000000000,7.7,8.8,9.9,11.22,33.44," +
+					"1,'2025-03-01','2025-03-01 12:00:00','2025-03-01 12:00:00'," +
+					"X'BEEFDEAD','clob3',0,'2025-01-01 00:00:03')");
+			}
+
+			// ── logger config (used by dbreader to stage SyncLite devices) ───
+			Files.writeString(dbreaderLoggerConf,
+				"local-data-stage-directory = " + this.stageDir + "\n" +
+				"local-command-stage-directory = " + this.commandDir + "\n" +
+				"destination-type = FS\n");
+
+			// ── dbreader config ───────────────────────────────────────────────
+			Files.writeString(dbreaderConfigPath,
+				"synclite-device-dir = " + dbreaderDbDir + "\n" +
+				"synclite-logger-configuration-file = " + dbreaderLoggerConf + "\n" +
+				"src-type = SQLITE\n" +
+				"src-connection-string = jdbc:sqlite:" + dbreaderSrcDbPath + "\n" +
+				"src-connection-timeout-s = 30\n" +
+				"src-dbreader-interval-s = 2\n" +
+				"src-dbreader-batch-size = 100000\n" +
+				"src-dbreader-processors = 1\n" +
+				"src-dbreader-method = INCREMENTAL\n" +
+				"dbreader-stop-after-first-iteration = false\n" +
+				"src-object-type = TABLE\n" +
+				"src-default-unique-key-column-list = id\n" +
+				"src-default-incremental-key-column-list = updated_at\n" +
+				"src-timestamp-incremental-key-initial-value = 0001-01-01 00:00:00\n" +
+				"src-default-soft-delete-condition = is_deleted = 1\n" +
+				"src-infer-schema-changes = true\n" +
+				"src-infer-object-drop = true\n" +
+				"dbreader-trace-level = DEBUG\n" +
+				"dbreader-update-statistics-interval-s = 5\n" +
+				"dbreader-enable-statistics-collector = true\n" +
+				"edition = DEVELOPER\n");
+
+			// ── dbreader metadata DB ─────────────────────────────────────────
+			// Register fat_table so dbreader knows which table to read and which
+			// columns drive incremental tracking and soft-delete detection.
+			// The allowed_columns JSON must match JDBC metadata exactly to avoid
+			// false schema-drift on startup.
+			try (Connection metaConn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderMetaDbPath);
+					Statement metaStmt = metaConn.createStatement()) {
+				metaStmt.execute(
+					"CREATE TABLE IF NOT EXISTS src_object_info(" +
+					"object_name TEXT PRIMARY KEY, object_type TEXT, " +
+					"allowed_columns TEXT, unique_key_columns TEXT, " +
+					"incremental_key_columns TEXT, group_name TEXT, " +
+					"group_position INTEGER, mask_columns TEXT, " +
+					"delete_condition TEXT, select_conditions TEXT, enable INTEGER)");
+				metaStmt.execute(
+					"CREATE TABLE IF NOT EXISTS src_object_reload_configurations(" +
+					"object_name TEXT PRIMARY KEY, " +
+					"reload_schema_on_next_restart INT, reload_schema_on_each_restart INT, " +
+					"reload_object_on_next_restart INT, reload_object_on_each_restart INT)");
+
+				String allowedCols;
+				try (Connection srcConn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath)) {
+					allowedCols = readJdbcSchemaAsJson(srcConn, fatTable);
+				}
+				metaStmt.execute(
+					"INSERT INTO src_object_info VALUES('" + fatTable + "','TABLE','" +
+					allowedCols.replace("'", "''") + "'," +
+					"'id','updated_at','',1,'','is_deleted = 1','',1)");
+				metaStmt.execute(
+					"INSERT INTO src_object_reload_configurations VALUES('" +
+					fatTable + "',0,0,0,0)");
+			}
+
+			// ── start dbreader (consolidator is already running) ─────────────
+			startDBReaderJob(dbreaderDbDir, dbreaderConfigPath);
+
+			// ── Phase 1: 3 initial rows replicated ───────────────────────────
+			waitForDbreaderReplicationRowCount(fatTable, 3);
+			// Spot-check key columns on row id=1
+			List<String> colText = dstDBReader.readRows(
+					"SELECT col_text FROM " + this.dstTablePrefix + fatTable + " WHERE id = 1");
+			if (colText.isEmpty() || !"hello".equals(colText.get(0))) {
+				throw new SyncLiteTestException("Phase 1: expected col_text='hello' for id=1, got: " + colText);
+			}
+			List<String> colBigint = dstDBReader.readRows(
+					"SELECT col_bigint FROM " + this.dstTablePrefix + fatTable + " WHERE id = 1");
+			if (colBigint.isEmpty() || !"9000000000".equals(colBigint.get(0))) {
+				throw new SyncLiteTestException("Phase 1: expected col_bigint=9000000000 for id=1, got: " + colBigint);
+			}
+
+			// ── Phase 2: UPDATE row id=2 ─────────────────────────────────────
+			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
+					Statement stmt = conn.createStatement()) {
+				stmt.execute(
+					"UPDATE " + fatTable + " SET " +
+					"col_text = 'updated', col_int = 999, col_real = 9.99, " +
+					"col_boolean = 0, col_clob = 'updated_clob', " +
+					"updated_at = '2025-04-01 00:00:10' WHERE id = 2");
+			}
+			waitForDbreaderReplicationValue(fatTable, "col_text", "2", "updated");
+			List<String> colInt = dstDBReader.readRows(
+					"SELECT col_int FROM " + this.dstTablePrefix + fatTable + " WHERE id = 2");
+			if (colInt.isEmpty() || !"999".equals(colInt.get(0))) {
+				throw new SyncLiteTestException("Phase 2: expected col_int=999 for id=2, got: " + colInt);
+			}
+
+			// ── Phase 3: Soft-DELETE row id=3 ────────────────────────────────
+			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
+					Statement stmt = conn.createStatement()) {
+				stmt.execute(
+					"UPDATE " + fatTable + " SET " +
+					"is_deleted = 1, updated_at = '2025-05-01 00:00:20' WHERE id = 3");
+			}
+			waitForDbreaderReplicationRowCount(fatTable, 2);
+			List<String> remainingIds = dstDBReader.readRows(
+					"SELECT id FROM " + this.dstTablePrefix + fatTable + " ORDER BY id");
+			if (remainingIds.size() != 2 || !"1".equals(remainingIds.get(0)) || !"2".equals(remainingIds.get(1))) {
+				throw new SyncLiteTestException("Phase 3: expected rows id=1,2 after soft-delete, got: " + remainingIds);
+			}
+
+			stopDBReaderJob();
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			try { stopDBReaderJob(); } catch (Exception ignored) {}
+			postTest(testName, "FAIL");
+		}
+	}
 
 	private final void testSQLiteReinitializeDevice() throws SyncLiteTestException {		
 		String testName = "testSQLiteReinitializeDevice";
