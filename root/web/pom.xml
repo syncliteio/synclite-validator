@@ -71,11 +71,20 @@
 										<include>synclite-dbreader.sh</include>
 									</includes>
 								</resource>
+
+								<resource>
+									<directory>${project.basedir}/../../../synclite-qreader/root/core/target/qreader</directory>
+									<includes>
+										<include>synclite-qreader.jar</include>
+										<include>synclite-qreader.bat</include>
+										<include>synclite-qreader.sh</include>
+									</includes>
+								</resource>
 			
 								<resource>
-									<directory>${project.basedir}/../../../synclite-db/db/target</directory>
+									<directory>${project.basedir}/../../../synclite-db/root/core/target</directory>
 									<includes>
-										<include>synclite-db-${revision}.jar</include>
+										<include>synclite-db*.jar</include>
 										<include>synclite-db.bat</include>
 										<include>synclite-db.sh</include>
 										<include>synclite_db.conf</include>
@@ -112,7 +121,7 @@
 							<goal>copy-resources</goal>
 						</goals>
 						<configuration>
-							<outputDirectory>${project.basedir}/src/main/webapp/WEB-INF/lib/lib</outputDirectory>
+						<outputDirectory>${project.basedir}/src/main/webapp/WEB-INF/lib/lib</outputDirectory>
 							<resources>
 								<resource>
 									<directory>${project.basedir}/../../../synclite-consolidator/root/core/target/consolidator/lib</directory>
@@ -172,6 +181,32 @@
 		    <artifactId>jeromq</artifactId>
 		    <version>0.5.2</version>
 		</dependency>
-	
+
+		<!-- https://mvnrepository.com/artifact/log4j/log4j -->
+		<dependency>
+			<groupId>log4j</groupId>
+			<artifactId>log4j</artifactId>
+			<version>1.2.17</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.slf4j</groupId>
+			<artifactId>slf4j-nop</artifactId>
+			<version>1.7.30</version>
+		</dependency>
+
+		<!-- https://mvnrepository.com/artifact/org.duckdb/duckdb_jdbc -->
+		<dependency>
+			<groupId>org.duckdb</groupId>
+			<artifactId>duckdb_jdbc</artifactId>
+			<version>1.5.2.0</version>
+		</dependency>
+
+		<dependency>
+		    <groupId>org.apache.derby</groupId>
+		    <artifactId>derby</artifactId>
+		    <version>10.13.1.1</version>
+		</dependency>
+
 	</dependencies>
 </project>

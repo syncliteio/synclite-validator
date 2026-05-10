@@ -21,8 +21,8 @@
 <%@page import="java.io.InputStreamReader"%>
 <%@page import="javax.websocket.Session"%>
 <%@page import="java.nio.file.Files"%>
-<%@ page language="java" contentType="text/html; charset=ISO-8859-1"
-	pageEncoding="ISO-8859-1"%>
+<%@ page language="java" contentType="text/html; charset=UTF-8"
+	pageEncoding="UTF-8"%>
 <%@ page import="java.sql.*"%>
 <%@ page import="org.sqlite.*"%>
 <!DOCTYPE html>
@@ -116,6 +116,32 @@ function autoRefresh() {
 									}
 								}
 
+								long currentDBReaderPID = 0;
+								{
+									Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
+									BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+									String line = stdout.readLine();
+									while (line != null) {
+										if (line.contains("com.synclite.dbreader.Main")) {
+											currentDBReaderPID = Long.valueOf(line.split(" ")[0]);
+										}
+										line = stdout.readLine();
+									}
+								}
+
+								long currentQReaderPID = 0;
+								{
+									Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
+									BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+									String line = stdout.readLine();
+									while (line != null) {
+										if (line.contains("com.synclite.qreader.Main")) {
+											currentQReaderPID = Long.valueOf(line.split(" ")[0]);
+										}
+										line = stdout.readLine();
+									}
+								}
+
 								long currentValidatorJobPID = 0;
 								{
 									Process jpsProc = Runtime.getRuntime().exec("jps -l -m");
@@ -151,6 +177,14 @@ function autoRefresh() {
 								out.println("<tr>");
 								out.println("<td> SyncLite DB Process ID </td>");
 								out.println("<td>" + currentSyncLiteDBPID + "</td>");
+								out.println("</tr>");
+								out.println("<tr>");
+								out.println("<td> DBReader Process ID </td>");
+								out.println("<td>" + currentDBReaderPID + "</td>");
+								out.println("</tr>");
+								out.println("<tr>");
+								out.println("<td> QReader Process ID </td>");
+								out.println("<td>" + currentQReaderPID + "</td>");
 								out.println("</tr>");
 								out.println("<tr>");
 								out.println("<td> Validator Job Process ID </td>");
