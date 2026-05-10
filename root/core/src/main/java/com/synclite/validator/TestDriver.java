@@ -20,6 +20,7 @@ import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
@@ -38,11 +39,21 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+import io.moquette.broker.Server;
+import io.moquette.broker.config.MemoryConfig;
+import io.moquette.BrokerConstants;
 
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
@@ -83,8 +94,21 @@ public class TestDriver implements Runnable{
 	private DBReader dstDBReader;
 	private String dstTablePrefix;
 	private String mode;
+	private Path qreaderDbDir;
+	private Path qreaderConfigPath;
+	private Path qreaderLoggerConf;
+	private Path qreaderDeviceDbPath;
+	private boolean qreaderEnabled = false;
+	private Path dbreaderDbDir;
+	private Path dbreaderSrcDbPath;
+	private Path dbreaderConfigPath;
+	private boolean dbreaderEnabled = false;
+	private Server embeddedMqttBroker;
+	private static final String QREADER_DEVICE_NAME = "testqreaderdevice";
+	private static final String QREADER_TABLE = "testQReader_tbl";
+	private static final String MQTT_BROKER_URL = "tcp://localhost:1883";
 	private static final String DEVICE_COMMIT_ID_READER_QUERY = "SELECT MAX(commit_id) FROM synclite_txn";
-	private static final Long CONSOLIDATION_WAIT_DURATION_MS = 300000L;
+	private static final Long CONSOLIDATION_WAIT_DURATION_MS = 600000L;
 	private static final Long CONSOLIDATION_CHECK_INTERVAL = 5000L;
 	private static final Long CONSOLIDATOR_JOB_WAIT_DURATION_MS = 300000L;
 
@@ -119,7 +143,7 @@ public class TestDriver implements Runnable{
 			Class.forName("io.synclite.logger.HyperSQL");
 			Class.forName("io.synclite.logger.HyperSQLAppender");
 			Class.forName("io.synclite.logger.Streaming");
-			Class.forName("io.synclite.logger.Telemetry");
+			Class.forName("io.synclite.logger.SQLiteStore");
 
 			loadConsolidatorConfig();
 
@@ -326,6 +350,319 @@ public class TestDriver implements Runnable{
 		}
 	}
 
+	private final void setupAndStartDBReaderJob() throws SyncLiteTestException {
+		Path dbreaderScript = this.corePath.resolve(isWindows() ? "synclite-dbreader.bat" : "synclite-dbreader.sh");
+		if (!Files.exists(dbreaderScript)) {
+			globalTracer.debug("Skipping dbreader setup: dbreader script not found at " + dbreaderScript);
+			return;
+		}
+
+		String dbReaderTable = "dbreadertable";
+		Path dbreaderTestRoot   = this.dbDir.resolve("testdbreader");
+		this.dbreaderDbDir      = dbreaderTestRoot.resolve("db");
+		Path dbreaderSrcDbDir   = dbreaderTestRoot.resolve("srcDb");
+		this.dbreaderSrcDbPath  = dbreaderSrcDbDir.resolve("source.db");
+		this.dbreaderConfigPath = dbreaderDbDir.resolve("synclite_dbreader.conf");
+		Path dbreaderMetaDbPath = dbreaderDbDir.resolve("synclite_dbreader_metadata.db");
+		Path dbreaderLoggerConf = dbreaderDbDir.resolve("synclite_logger.conf");
+
+		try {
+			// Clean up any stale dbreader state from a previous run
+			if (Files.exists(dbreaderDbDir)) {
+				try (java.util.stream.Stream<Path> walk = Files.walk(dbreaderDbDir)) {
+					walk.sorted(java.util.Comparator.reverseOrder())
+						.map(Path::toFile)
+						.forEach(java.io.File::delete);
+				}
+			}
+			if (Files.exists(dbreaderSrcDbDir)) {
+				try (java.util.stream.Stream<Path> walk = Files.walk(dbreaderSrcDbDir)) {
+					walk.sorted(java.util.Comparator.reverseOrder())
+						.map(Path::toFile)
+						.forEach(java.io.File::delete);
+				}
+			}
+			Files.createDirectories(dbreaderDbDir);
+			Files.createDirectories(dbreaderSrcDbDir);
+
+			// Source SQLite database
+			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
+					Statement stmt = conn.createStatement()) {
+				stmt.execute(
+					"CREATE TABLE " + dbReaderTable + " (" +
+					"id INTEGER PRIMARY KEY, " +
+					"col_text TEXT, " +
+					"col_varchar VARCHAR(100), " +
+					"col_int INTEGER, " +
+					"col_smallint SMALLINT, " +
+					"col_bigint BIGINT, " +
+					"col_real REAL, " +
+					"col_double DOUBLE, " +
+					"col_float FLOAT, " +
+					"col_numeric NUMERIC(10,2), " +
+					"col_decimal DECIMAL(8,4), " +
+					"col_boolean BOOLEAN, " +
+					"col_date DATE, " +
+					"col_datetime DATETIME, " +
+					"col_timestamp TIMESTAMP, " +
+					"col_blob BLOB, " +
+					"col_clob CLOB, " +
+					"is_deleted INTEGER DEFAULT 0, " +
+					"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
+				stmt.execute(
+					"INSERT INTO " + dbReaderTable + " VALUES(" +
+					"1,'hello','varchar_1',10,2,9000000000,1.1,2.2,3.3,12.34,56.78," +
+					"1,'2025-01-01','2025-01-01 10:00:00','2025-01-01 10:00:00'," +
+					"X'DEADBEEF','clob1',0,'2025-01-01 00:00:01')");
+				stmt.execute(
+					"INSERT INTO " + dbReaderTable + " VALUES(" +
+					"2,'world','varchar_2',20,4,8000000000,4.4,5.5,6.6,78.90,12.34," +
+					"0,'2025-02-01','2025-02-01 11:00:00','2025-02-01 11:00:00'," +
+					"X'CAFEBABE','clob2',0,'2025-01-01 00:00:02')");
+				stmt.execute(
+					"INSERT INTO " + dbReaderTable + " VALUES(" +
+					"3,'test','varchar_3',30,6,7000000000,7.7,8.8,9.9,11.22,33.44," +
+					"1,'2025-03-01','2025-03-01 12:00:00','2025-03-01 12:00:00'," +
+					"X'BEEFDEAD','clob3',0,'2025-01-01 00:00:03')");
+			}
+
+			// Logger config
+			Files.writeString(dbreaderLoggerConf,
+				"local-data-stage-directory = " + this.stageDir + "\n" +
+				"local-command-stage-directory = " + this.commandDir + "\n" +
+				"destination-type = FS\n");
+
+			// DBReader config
+			Files.writeString(dbreaderConfigPath,
+				"synclite-device-dir = " + dbreaderDbDir + "\n" +
+				"synclite-logger-configuration-file = " + dbreaderLoggerConf + "\n" +
+				"src-type = SQLITE\n" +
+				"src-connection-string = jdbc:sqlite:" + dbreaderSrcDbPath + "\n" +
+				"src-connection-timeout-s = 30\n" +
+				"src-dbreader-interval-s = 2\n" +
+				"src-dbreader-batch-size = 100000\n" +
+				"src-dbreader-processors = 1\n" +
+				"src-dbreader-method = INCREMENTAL\n" +
+				"dbreader-stop-after-first-iteration = false\n" +
+				"src-object-type = TABLE\n" +
+				"src-default-unique-key-column-list = id\n" +
+				"src-default-incremental-key-column-list = updated_at\n" +
+				"src-timestamp-incremental-key-initial-value = 0001-01-01 00:00:00\n" +
+				"src-default-soft-delete-condition = is_deleted = 1\n" +
+				"src-infer-schema-changes = true\n" +
+				"src-infer-object-drop = true\n" +
+				"dbreader-trace-level = DEBUG\n" +
+				"dbreader-update-statistics-interval-s = 5\n" +
+				"dbreader-enable-statistics-collector = true\n" +
+				"edition = DEVELOPER\n");
+
+			// DBReader metadata DB
+			try (Connection metaConn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderMetaDbPath);
+					Statement metaStmt = metaConn.createStatement()) {
+				metaStmt.execute(
+					"CREATE TABLE IF NOT EXISTS src_object_info(" +
+					"object_name TEXT PRIMARY KEY, object_type TEXT, " +
+					"allowed_columns TEXT, unique_key_columns TEXT, " +
+					"incremental_key_columns TEXT, group_name TEXT, " +
+					"group_position INTEGER, mask_columns TEXT, " +
+					"delete_condition TEXT, select_conditions TEXT, enable INTEGER)");
+				metaStmt.execute(
+					"CREATE TABLE IF NOT EXISTS src_object_reload_configurations(" +
+					"object_name TEXT PRIMARY KEY, " +
+					"reload_schema_on_next_restart INT, reload_schema_on_each_restart INT, " +
+					"reload_object_on_next_restart INT, reload_object_on_each_restart INT)");
+
+				String allowedCols;
+				try (Connection srcConn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath)) {
+					allowedCols = readJdbcSchemaAsJson(srcConn, dbReaderTable);
+				}
+				metaStmt.execute(
+					"INSERT INTO src_object_info VALUES('" + dbReaderTable + "','TABLE','" +
+					allowedCols.replace("'", "''") + "'," +
+					"'id','updated_at','',1,'','is_deleted = 1','',1)");
+				metaStmt.execute(
+					"INSERT INTO src_object_reload_configurations VALUES('" +
+					dbReaderTable + "',0,0,0,0)");
+			}
+
+			// Start dbreader
+			startDBReaderJob(dbreaderDbDir, dbreaderConfigPath);
+			Thread.sleep(5000);
+			this.dbreaderEnabled = true;
+			globalTracer.debug("DBReader started and ready");
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to set up and start dbreader job : ", e);
+		}
+	}
+
+	private final long getQReaderJobPID() throws SyncLiteTestException {
+		try {
+			long currentJobPID = 0;
+			String javaHome = System.getenv("JAVA_HOME");
+			String jpsExe = (javaHome != null)
+					? javaHome + (isWindows() ? "\\bin\\jps" : "/bin/jps")
+					: "jps";
+			String[] cmdArray = {jpsExe, "-l", "-m"};
+			Process jpsProc = Runtime.getRuntime().exec(cmdArray);
+			BufferedReader stdout = new BufferedReader(new InputStreamReader(jpsProc.getInputStream()));
+			String line = stdout.readLine();
+			while (line != null) {
+				if (line.contains("com.synclite.qreader.Main")) {
+					try {
+						currentJobPID = Long.valueOf(line.split(" ")[0]);
+					} catch (NumberFormatException ignored) {}
+				}
+				line = stdout.readLine();
+			}
+			return currentJobPID;
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to get qreader job PID : ", e);
+		}
+	}
+
+	private final void startQReaderJob(Path dbDir, Path config) throws SyncLiteTestException {
+		globalTracer.debug("Starting qreader job");
+		try {
+			String corePathStr = this.corePath.toString();
+			if (isWindows()) {
+				String scriptPath = Path.of(corePathStr, "synclite-qreader.bat").toString();
+				String[] cmdArray = {scriptPath, "read", "--db-dir", dbDir.toString(), "--config", config.toString()};
+				Runtime.getRuntime().exec(cmdArray);
+			} else {
+				Path scriptPath = Path.of(corePathStr, "synclite-qreader.sh");
+				Set<PosixFilePermission> perms = Files.getPosixFilePermissions(scriptPath);
+				if (!perms.contains(PosixFilePermission.OWNER_EXECUTE)) {
+					perms.add(PosixFilePermission.OWNER_EXECUTE);
+					Files.setPosixFilePermissions(scriptPath, perms);
+				}
+				String[] cmdArray = {scriptPath.toString(), "read", "--db-dir", dbDir.toString(), "--config", config.toString()};
+				Runtime.getRuntime().exec(cmdArray);
+			}
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to start qreader job : ", e);
+		}
+	}
+
+	private final void setupAndStartQReaderJob() throws SyncLiteTestException {
+		Path qreaderScript = this.corePath.resolve(isWindows() ? "synclite-qreader.bat" : "synclite-qreader.sh");
+		if (!Files.exists(qreaderScript)) {
+			globalTracer.debug("Skipping qreader setup: qreader script not found at " + qreaderScript);
+			return;
+		}
+
+		// Start embedded MQTT broker so the test is self-contained
+		try {
+			Properties brokerProps = new Properties();
+			brokerProps.setProperty(BrokerConstants.PORT_PROPERTY_NAME, "1883");
+			brokerProps.setProperty(BrokerConstants.HOST_PROPERTY_NAME, "0.0.0.0");
+			brokerProps.setProperty(BrokerConstants.ALLOW_ANONYMOUS_PROPERTY_NAME, "true");
+			embeddedMqttBroker = new Server();
+			embeddedMqttBroker.startServer(new MemoryConfig(brokerProps));
+			globalTracer.debug("Embedded MQTT broker started on port 1883");
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to start embedded MQTT broker: ", e);
+		}
+
+		Path qreaderTestRoot = this.dbDir.resolve("testqreader");
+		this.qreaderDbDir = qreaderTestRoot.resolve("db");
+		this.qreaderConfigPath = qreaderDbDir.resolve("synclite-qreader.conf");
+		Path qreaderMetaDbPath = qreaderDbDir.resolve("synclite_qreader_metadata.db");
+		this.qreaderLoggerConf = qreaderDbDir.resolve("synclite_logger.conf");
+		this.qreaderDeviceDbPath = qreaderDbDir.resolve(QREADER_DEVICE_NAME + ".db");
+
+		try {
+			// Clean up any stale qreader state from a previous run
+			if (Files.exists(qreaderDbDir)) {
+				try (java.util.stream.Stream<Path> walk = Files.walk(qreaderDbDir)) {
+					walk.sorted(java.util.Comparator.reverseOrder())
+						.map(Path::toFile)
+						.forEach(java.io.File::delete);
+				}
+			}
+			Files.createDirectories(qreaderDbDir);
+
+			// Logger config (used by qreader to stage SyncLite devices)
+			Files.writeString(qreaderLoggerConf,
+				"local-data-stage-directory = " + this.stageDir + "\n" +
+				"local-command-stage-directory = " + this.commandDir + "\n" +
+				"destination-type = FS\n");
+
+			// QReader config
+			Files.writeString(qreaderConfigPath,
+				"synclite-device-dir = " + qreaderDbDir + "\n" +
+				"synclite-logger-configuration-file = " + qreaderLoggerConf + "\n" +
+				"mqtt-broker-url = " + MQTT_BROKER_URL + "\n" +
+				"mqtt-qos-level = 1\n" +
+				"mqtt-clean-session = true\n" +
+				"mqtt-broker-connection-timeout-s = 10\n" +
+				"mqtt-broker-connection-retry-interval-s = 2\n" +
+				"qreader-synclite-device-type = SQLITE_APPENDER\n" +
+				"qreader-map-devices-to-single-synclite-device = true\n" +
+				"qreader-default-synclite-device-name = " + QREADER_DEVICE_NAME + "\n" +
+				"qreader-ignore-messages-for-undefined-topics = false\n" +
+				"qreader-default-synclite-table-name = default_table\n" +
+				"qreader-ignore-corrupt_messages = false\n" +
+				"qreader-corrupt-messages-synclite-table-name = corrupt_messages\n" +
+				"qreader-message-batch-processing = false\n" +
+				"qreader-message-batch-flush-interval-ms = 1000\n" +
+				"qreader-trace-level = DEBUG\n" +
+				"mqtt-message-header-delimiter = /\n" +
+				"src-message-field-delimiter = ,\n" +
+				"src-message-format = CSV\n");
+
+			// Pre-populate metadata DB: register the topic so qreader knows which table to write to
+			try (Connection metaConn = DriverManager.getConnection("jdbc:sqlite:" + qreaderMetaDbPath);
+					Statement metaStmt = metaConn.createStatement()) {
+				metaStmt.execute(
+					"CREATE TABLE IF NOT EXISTS topic_info (" +
+					"topic_name TEXT PRIMARY KEY, " +
+					"topic_table_name TEXT, " +
+					"topic_field_count INTEGER, " +
+					"topic_create_table_sql TEXT, " +
+					"topic_table_column_list TEXT, " +
+					"enable INTEGER DEFAULT 1)");
+				metaStmt.execute(
+					"INSERT INTO topic_info(topic_name, topic_table_name, topic_field_count, " +
+					"topic_create_table_sql, topic_table_column_list, enable) VALUES (" +
+					"'" + QREADER_TABLE + "','" + QREADER_TABLE + "',2," +
+					"'CREATE TABLE IF NOT EXISTS " + QREADER_TABLE + "(col1 TEXT, col2 TEXT)'," +
+					"'device_name,col1,col2',1)");
+			}
+
+			startQReaderJob(qreaderDbDir, qreaderConfigPath);
+			// Give qreader time to connect to broker and register subscriptions
+			Thread.sleep(5000);
+			this.qreaderEnabled = true;
+			globalTracer.debug("QReader started and ready");
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to set up and start qreader job : ", e);
+		}
+	}
+
+	private final void stopQReaderJob() throws SyncLiteTestException {
+		globalTracer.debug("Stopping qreader job");
+		try {
+			long currentJobPID = getQReaderJobPID();
+			if (currentJobPID > 0) {
+				if (isWindows()) {
+					String[] cmdArray = {"taskkill", "/F", "/PID", String.valueOf(currentJobPID)};
+					Runtime.getRuntime().exec(cmdArray);
+				} else {
+					String[] cmdArray = {"kill", "-9", String.valueOf(currentJobPID)};
+					Runtime.getRuntime().exec(cmdArray);
+				}
+			}
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to stop qreader job : ", e);
+		}
+		// Stop embedded MQTT broker
+		if (embeddedMqttBroker != null) {
+			embeddedMqttBroker.stopServer();
+			embeddedMqttBroker = null;
+			globalTracer.debug("Embedded MQTT broker stopped");
+		}
+	}
+
 	private final void stopJobs() throws SyncLiteTestException {
 		//Stop synclite-db
 		try {
@@ -385,6 +722,22 @@ public class TestDriver implements Runnable{
 			}
 		} catch (Exception e) {
 			//Ignore
+		}
+		// Stop qreader job if it was started
+		if (qreaderEnabled) {
+			try {
+				stopQReaderJob();
+			} catch (Exception e) {
+				//Ignore
+			}
+		}
+		// Stop dbreader job if it was started
+		if (dbreaderEnabled) {
+			try {
+				stopDBReaderJob();
+			} catch (Exception e) {
+				//Ignore
+			}
 		}
 	}
 	private void initDstDBReader(int dstIndex) {
@@ -487,10 +840,10 @@ public class TestDriver implements Runnable{
 		testHyperSQLPreparedStmtBasic();
 		testHyperSQLCommitRollback();
 
-		testTelemetryPreparedStmtBasic();
-		testTelemetryFatTableAutoArgInlining();
-		testTelemetryFatTableFixedInlinedArgs();
-		testTelemetryInsertWithColList();
+		testSQLiteStorePreparedStmtBasic();
+		testSQLiteStoreFatTableAutoArgInlining();
+		testSQLiteStoreFatTableFixedInlinedArgs();
+		testSQLiteStoreInsertWithColList();
 
 		testStreamingPreparedStmtBasic();
 
@@ -510,99 +863,71 @@ public class TestDriver implements Runnable{
 	 */
 
 	public void runTests() throws SyncLiteTestException, InterruptedException, ExecutionException {
-		createMockDevice();	
-		//Add test method calls here
+		       createMockDevice();
+		       setupAndStartDBReaderJob();
+		       setupAndStartQReaderJob();
+		       // Add test method calls here
+		       // List of test method references
+		       List<Callable<Void>> testTasks = Arrays.asList(
+			       () -> { testSQLiteStmtBasic(); return null; },
+			       () -> { testSQLitePreparedStmtBasic(); return null; },
+			       () -> { testSQLiteTableMerge(); return null; },
+			       () -> { testSQLiteCommitRollback(); return null; },
+			       () -> { testSQLiteFatTableAutoArgInlining(); return null; },
+			       () -> { testSQLiteFatTableFixedInlinedArgs(); return null; },
+			       () -> { testDuckDBStmtBasic(); return null; },
+			       () -> { testDuckDBPreparedStmtBasic(); return null; },
+			       () -> { testDuckDBCommitRollback(); return null; },
+			       () -> { testDerbyStmtBasic(); return null; },
+			       () -> { testDerbyPreparedStmtBasic(); return null; },
+			       () -> { testDerbyCommitRollback(); return null; },
+			       () -> { testH2StmtBasic(); return null; },
+			       () -> { testH2PreparedStmtBasic(); return null; },
+			       () -> { testH2CommitRollback(); return null; },
+			       () -> { testHyperSQLStmtBasic(); return null; },
+			       () -> { testHyperSQLPreparedStmtBasic(); return null; },
+			       () -> { testHyperSQLCommitRollback(); return null; },
+			       () -> { testSQLiteInSyncLiteDB(); return null; },
+			       () -> { testDuckDBInSyncLiteDB(); return null; },
+			       () -> { testH2InSyncLiteDB(); return null; },
+			       () -> { testDerbyInSyncLiteDB(); return null; },
+			       () -> { testHyperSQLInSyncLiteDB(); return null; },
+			       () -> { testSQLiteAppenderInSyncLiteDB(); return null; },
+			       () -> { testDuckDBAppenderInSyncLiteDB(); return null; },
+			       () -> { testH2AppenderInSyncLiteDB(); return null; },
+			       () -> { testDerbyAppenderInSyncLiteDB(); return null; },
+			       () -> { testHyperSQLAppenderInSyncLiteDB(); return null; },
+			       () -> { testSQLiteStoreAPIBasic(); return null; },
+			       () -> { testStreamingPreparedStmtBasic(); return null; },
+			       () -> { testStreamingAPIBasic(); return null; },
+			       () -> { testJedisAPIBasic(); return null; },
+			       () -> { testKafkaProducerAPIBasic(); return null; },
+			       () -> { testStreamingInSyncLiteDB(); return null; },
+			       () -> { testQReader(); return null; }
+		       );
 
-		// List of test method references
-		List<Callable<Void>> testTasks = Arrays.asList(
-				() -> { testSQLiteStmtBasic(); return null; },
-				() -> { testSQLitePreparedStmtBasic(); return null; },
-				() -> { testSQLiteTableMerge(); return null; },
-				() -> { testSQLiteCommitRollback(); return null; },
-				() -> { testSQLiteFatTableAutoArgInlining(); return null; },
-				() -> { testSQLiteFatTableFixedInlinedArgs(); return null; },
+		       ExecutorService executorService = Executors.newFixedThreadPool(numThreads);
+		       List<Future<Void>> futures = executorService.invokeAll(testTasks);
+		       for (Future<Void> future : futures) {
+			       future.get();  
+		       }
+		       // Shut down the executor
+		       executorService.shutdown();        
+		       // Run tests which cannot be in parallel execution
+		       // These tests restart the consolidator process and hence must be executed sequentially at the end.
+		       testDBReader();
+		       testSQLiteReinitializeDevice();
+		   }
+	//
+	//=================================================
 
-				() -> { testDuckDBStmtBasic(); return null; },
-				() -> { testDuckDBPreparedStmtBasic(); return null; },
-				() -> { testDuckDBCommitRollback(); return null; },
-
-				() -> { testDerbyStmtBasic(); return null; },
-				() -> { testDerbyPreparedStmtBasic(); return null; },
-				() -> { testDerbyCommitRollback(); return null; },
-
-				() -> { testH2StmtBasic(); return null; },
-				() -> { testH2PreparedStmtBasic(); return null; },
-				() -> { testH2CommitRollback(); return null; },
-
-				() -> { testHyperSQLStmtBasic(); return null; },
-				() -> { testHyperSQLPreparedStmtBasic(); return null; },
-				() -> { testHyperSQLCommitRollback(); return null; },
-
-				() -> { testTelemetryPreparedStmtBasic(); return null; },
-				() -> { testTelemetryFatTableAutoArgInlining(); return null; },
-				() -> { testTelemetryFatTableFixedInlinedArgs(); return null; },
-				() -> { testTelemetryInsertWithColList(); return null; },
-
-				() -> { testStreamingPreparedStmtBasic(); return null; },
-
-				() -> { testSQLiteAppenderPreparedStmtBasic(); return null; },
-				() -> { testDuckDBAppenderPreparedStmtBasic(); return null; },
-				() -> { testDerbyAppenderPreparedStmtBasic(); return null; },
-				() -> { testH2AppenderPreparedStmtBasic(); return null; },
-				() -> { testHyperSQLAppenderPreparedStmtBasic(); return null; },
-
-				() -> { testSQLiteAppenderFatTableAutoArgInlining(); return null; },
-				() -> { testSQLiteAppenderFatTableFixedInlinedArgs(); return null; },
-				() -> { testSQLiteAppenderInsertWithColList(); return null; },
-				
-				() -> { testSQLiteCallback(); return null; },
-				
-				() -> { testSQLiteInSyncLiteDB(); return null; },
-				() -> { testDuckDBInSyncLiteDB(); return null; },
-				() -> { testH2InSyncLiteDB(); return null; },
-				() -> { testDerbyInSyncLiteDB(); return null; },
-				() -> { testHyperSQLInSyncLiteDB(); return null; },
-				() -> { testSQLiteAppenderInSyncLiteDB(); return null; },
-				() -> { testDuckDBAppenderInSyncLiteDB(); return null; },
-				() -> { testH2AppenderInSyncLiteDB(); return null; },
-				() -> { testDerbyAppenderInSyncLiteDB(); return null; },
-				() -> { testHyperSQLAppenderInSyncLiteDB(); return null; },
-				() -> { testStreamingInSyncLiteDB(); return null; },
-				() -> { testDBReaderReplication(); return null; }
-
-				);
-
-		ExecutorService executorService = Executors.newFixedThreadPool(numThreads);
-
-		List<Future<Void>> futures = executorService.invokeAll(testTasks);
-
-		for (Future<Void> future : futures) {
-			future.get();  
-		}
-
-		// Shut down the executor
-		executorService.shutdown();        
-
-		//Run tests which cannot be in parallel execution
-
-		//The reinitialize test restarts consolidator process and hence it needs executed separately at the end.
-		testSQLiteReinitializeDevice();
-	}
-
-	private void createMockDevice() throws SyncLiteTestException {		
+	private void createMockDevice() throws SyncLiteTestException {
 		globalTracer.error("Testing mock device");
 		String testName = "mockTest";
 		try {
-			Path testDBPath = dbDir.resolve(testName + ".db");			
+			Path testDBPath = dbDir.resolve(testName + ".db");
 			SQLite.initialize(testDBPath, loggerConfig, testName);
 			String testDBURL = "jdbc:synclite_sqlite:" + dbDir.resolve(testDBPath);
-
-			//Test a basic scenario 
-			//1. create a table with an INTEGER, FLOATING POINT, TEXT and BLOB column
-			//2. INSERT few rows using statement
-			//3. UPDATE a row using statement
-			//4. DELETE a row using statement
-			//5. Validate data in db file with that of consolidated db.			
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
@@ -621,7 +946,7 @@ public class TestDriver implements Runnable{
 	}
 
 	private final void initTracer() {
-		this.globalTracer = Logger.getLogger(TestDriver.class);    	
+		this.globalTracer = Logger.getLogger(TestDriver.class);    
 		globalTracer.setLevel(Level.DEBUG);
 		RollingFileAppender fa = new RollingFileAppender();
 		fa.setName("SyncLiteValidatorTracer");
@@ -633,7 +958,7 @@ public class TestDriver implements Runnable{
 		globalTracer.addAppender(fa);
 	}
 
-	private final synchronized void preTest(String testName) throws SyncLiteTestException {		
+	private final synchronized void preTest(String testName) throws SyncLiteTestException {
 		String startTimeStr = Instant.now().toString().replace("T", " ").replace("Z", "");
 		lastTestStartTime.set(System.currentTimeMillis());
 		try {
@@ -650,8 +975,8 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-	private final synchronized void postTest(String testName, String executionStatus) throws SyncLiteTestException {		
-		String endTimeStr = Instant.now().toString().replace("T", " ").replace("Z", "");		
+	private final synchronized void postTest(String testName, String executionStatus) throws SyncLiteTestException {
+		String endTimeStr = Instant.now().toString().replace("T", " ").replace("Z", "");
 		lastTestFinishTime.set(System.currentTimeMillis());
 		long testExecutionTime = lastTestFinishTime.get() - lastTestStartTime.get();
 		try {
@@ -704,16 +1029,16 @@ public class TestDriver implements Runnable{
 
 		dstSqlBuilder.append(" FROM ");
 		dstSqlBuilder.append(this.dstTablePrefix + tabName);
-		dstSqlBuilder.append(" WHERE synclite_device_name = '" +  deviceName + "'");	
+		dstSqlBuilder.append(" WHERE synclite_device_name = '" +  deviceName + "'");
 		dstSqlBuilder.append(orderByClauseBuilder.toString());
 
 		DBReader deviceDBReader = null;
 		Properties props = new Properties();
-		if (deviceType == DeviceType.DUCKDB || deviceType == DeviceType.DUCKDB_APPENDER) {			
+		if (deviceType == DeviceType.DUCKDB || deviceType == DeviceType.DUCKDB_APPENDER) {
 			props.setProperty("duckdb.read_only", "true");
 			deviceDBReader = new DBReader(DstType.DUCKDB, "jdbc:duckdb:" + devicePath, props, this.globalTracer);
 		} else if (deviceType == DeviceType.DERBY || deviceType == DeviceType.DERBY_APPENDER) {
-			props.setProperty("readonly", "true"); // Set read-only property
+			props.setProperty("readonly", "true");
 			deviceDBReader = new DBReader(DstType.DERBY, "jdbc:derby:" + devicePath, props, this.globalTracer);
 		} else if (deviceType == DeviceType.H2 || deviceType == DeviceType.H2_APPENDER) {
 			deviceDBReader = new DBReader(DstType.H2, "jdbc:h2:" + devicePath, props, this.globalTracer);
@@ -727,7 +1052,6 @@ public class TestDriver implements Runnable{
 		List<String> dstDataRows = dstDBReader.readRows(dstSqlBuilder.toString());
 
 		String sql = dstSqlBuilder.toString();
-		//Compare deviceDataRows and dstDataRows
 		if (deviceDataRows.size() != dstDataRows.size()) {
 			dumpRows(deviceDataRows, dstDataRows, sql);
 			throw new SyncLiteTestException("Count mismatch identified. Device row count: " + deviceDataRows.size() + " . Destination row count : " + dstDataRows.size());
@@ -736,14 +1060,13 @@ public class TestDriver implements Runnable{
 		for (int i = 0; i < deviceDataRows.size(); i++) {
 			String deviceRow = deviceDataRows.get(i);
 			String dstRow = dstDataRows.get(i);
-
 			if (! deviceRow.equals(dstRow)) {
 				throw new SyncLiteTestException("Data mismatch identified at row number : " + i + ". Device row : " + deviceRow + ". Destination row : " + dstRow);
 			}
 		}
 	}
 
-	private final void verifyData(List<String> expectedRows, String tabName, List<String> cols, List<String> orderCols) throws SyncLiteTestException, InterruptedException {	
+	private final void verifyData(List<String> expectedRows, String tabName, List<String> cols, List<String> orderCols) throws SyncLiteTestException, InterruptedException {
 		globalTracer.debug("Verifying data for table :" + tabName);
 		StringBuilder dstSqlBuilder = new StringBuilder();
 		dstSqlBuilder.append("SELECT ");
@@ -775,9 +1098,7 @@ public class TestDriver implements Runnable{
 		String sql = dstSqlBuilder.toString();
 		List<String> dstDataRows = dstDBReader.readRows(sql);
 
-		//Compare expectedRows and dstDataRows
-
-		if (expectedRows.size() != dstDataRows.size()) {			
+		if (expectedRows.size() != dstDataRows.size()) {
 			dumpRows(expectedRows, dstDataRows, sql);
 			throw new SyncLiteTestException("Count mismatch identified. Expected row count: " + expectedRows.size() + " . Destination row count : " + dstDataRows.size());
 		}
@@ -785,7 +1106,6 @@ public class TestDriver implements Runnable{
 		for (int i = 0; i < expectedRows.size(); i++) {
 			String expectedRow = expectedRows.get(i);
 			String dstRow = dstDataRows.get(i);
-
 			if (! expectedRow.equals(dstRow)) {
 				dumpRows(expectedRows, dstDataRows, sql);
 				throw new SyncLiteTestException("Data mismatch identified at row number : " + i + ". Expected row : " + expectedRow + ". Destination row : " + dstRow);
@@ -802,12 +1122,76 @@ public class TestDriver implements Runnable{
 		globalTracer.debug("Current Rows : ");
 		for (String s : currentRows) {
 			globalTracer.debug(s);
-		}		
+		}
+	}
+
+	/**
+	 * Scans every subdirectory of stageDir and dumps the last {@code lines} rows
+	 * of the commandlog from each {@code 0.sqllog} found.  Useful for diagnosing
+	 * which transactions were actually staged (including any that should have been
+	 * suppressed by a rollback).
+	 */
+	private final void dumpStageDirCommandLog(String label, int lines) {
+		try {
+			globalTracer.error("[" + label + "] === Stage commandlog dump ===");
+			if (!Files.exists(stageDir)) {
+				globalTracer.error("[" + label + "] stageDir does not exist: " + stageDir);
+				return;
+			}
+			try (java.util.stream.Stream<Path> dirs = Files.list(stageDir)) {
+				dirs.filter(Files::isDirectory).forEach(devDir -> {
+					Path sqllog = devDir.resolve("0.sqllog");
+					if (!Files.exists(sqllog)) return;
+					try (java.sql.Connection c = DriverManager.getConnection("jdbc:sqlite:" + sqllog);
+							java.sql.Statement s = c.createStatement()) {
+						// total entries
+						long cnt = 0;
+						try (ResultSet rs = s.executeQuery("SELECT COUNT(*) FROM commandlog")) {
+							if (rs.next()) cnt = rs.getLong(1);
+						}
+						globalTracer.error("[" + label + "] Stage dir: " + devDir.getFileName() + " | commandlog total rows: " + cnt);
+						// last N rows
+						try (ResultSet rs = s.executeQuery(
+								"SELECT change_number, commit_id, sql FROM commandlog ORDER BY change_number DESC LIMIT " + lines)) {
+							while (rs.next()) {
+								globalTracer.error("[" + label + "]   change=" + rs.getLong(1)
+									+ " commit_id=" + rs.getLong(2)
+									+ " sql=" + rs.getString(3));
+							}
+						}
+					} catch (Exception e2) {
+						globalTracer.error("[" + label + "] Failed to query commandlog in " + sqllog + ": " + e2.getMessage());
+					}
+				});
+			}
+		} catch (Exception e) {
+			globalTracer.error("[" + label + "] dumpStageDirCommandLog failed: " + e.getMessage());
+		}
+	}
+
+	/**
+	 * Dumps the last {@code lines} lines of the consolidator trace file.
+	 */
+	private final void dumpConsolidatorTrace(String label, int lines) {
+		try {
+			Path tracePath = workDir.resolve("synclite_consolidator.trace");
+			if (!Files.exists(tracePath)) {
+				globalTracer.error("[" + label + "] Consolidator trace not found: " + tracePath);
+				return;
+			}
+			List<String> all = Files.readAllLines(tracePath);
+			int from = Math.max(0, all.size() - lines);
+			globalTracer.error("[" + label + "] === Last " + lines + " lines of consolidator trace ===");
+			for (String ln : all.subList(from, all.size())) {
+				globalTracer.error("[" + label + "] " + ln);
+			}
+		} catch (Exception e) {
+			globalTracer.error("[" + label + "] dumpConsolidatorTrace failed: " + e.getMessage());
+		}
 	}
 
 	private final void waitForConsolidationStartup() throws SyncLiteTestException {
 		globalTracer.debug("Waiting for data consolidation startup");
-		//Read every 5 seconds for 5 minutes and then give up.
 		try {
 			long waited = 0;
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
@@ -821,18 +1205,17 @@ public class TestDriver implements Runnable{
 					waited += CONSOLIDATION_CHECK_INTERVAL;
 				}
 			}
-			throw new SyncLiteTestException("Data Consolidation has not started within " + CONSOLIDATION_WAIT_DURATION_MS + " (ms).");			
+			throw new SyncLiteTestException("Data Consolidation has not started within " + CONSOLIDATION_WAIT_DURATION_MS + " (ms).");
 		} catch (InterruptedException e) {
 			Thread.interrupted();
 		}
 	}
 
-	private final void waitForConsolidation(String deviceName, DeviceType deviceType, Path devicePath) throws SyncLiteTestException {		
+	private final void waitForConsolidation(String deviceName, DeviceType deviceType, Path devicePath) throws SyncLiteTestException {
 		globalTracer.debug("Waiting for data consolidation of the executed workload");
-		//Read every 5 seconds for 5 minutes and then give up.
 		try {
 			long waited = 0;
-			long deviceCommitID =0;
+			long deviceCommitID = 0;
 			long dstCommitID = 0;
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
 				DBReader deviceDBReader;
@@ -841,7 +1224,7 @@ public class TestDriver implements Runnable{
 					props.setProperty("duckdb.read_only", "true");
 					deviceDBReader = new DBReader(DstType.DUCKDB, "jdbc:duckdb:" + devicePath.toString(), props, this.globalTracer);
 				} else if (deviceType == DeviceType.DERBY || deviceType == DeviceType.DERBY_APPENDER) {
-					props.setProperty("readonly", "true"); // Set read-only property
+					props.setProperty("readonly", "true");
 					deviceDBReader = new DBReader(DstType.DERBY, "jdbc:derby:" + devicePath.toString(), props, this.globalTracer);
 				} else if (deviceType == DeviceType.H2 || deviceType == DeviceType.H2_APPENDER) {
 					deviceDBReader = new DBReader(DstType.H2, "jdbc:h2:" + devicePath.toString(), props, this.globalTracer);
@@ -852,7 +1235,6 @@ public class TestDriver implements Runnable{
 				}
 				deviceCommitID = deviceDBReader.readScalarLong(DEVICE_COMMIT_ID_READER_QUERY);
 				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
-
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
 				if (deviceCommitID == dstCommitID) {
@@ -862,41 +1244,39 @@ public class TestDriver implements Runnable{
 					waited += CONSOLIDATION_CHECK_INTERVAL;
 				}
 			}
-			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);			
+			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);
 		} catch (InterruptedException e) {
 			Thread.interrupted();
 		}
 	}
 
-	private final void waitForConsolidationOfSyncLiteDB(String deviceName, DeviceType deviceType, Path devicePath) throws SyncLiteTestException {		
+	private final void waitForConsolidationOfSyncLiteDB(String deviceName, DeviceType deviceType, Path devicePath) throws SyncLiteTestException {
 		globalTracer.debug("Waiting for data consolidation of the executed workload");
-		//Read every 5 seconds for 5 minutes and then give up.
 		try {
 			long waited = 0;
 			long deviceCommitID = 0;
 			long dstCommitID = 0;
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
 				try {
-					SyncLiteDBResult r = executeSQL(devicePath, null, DEVICE_COMMIT_ID_READER_QUERY, null);					
+					SyncLiteDBResult r = executeSQL(deviceName, null, DEVICE_COMMIT_ID_READER_QUERY, null);
 					if (r.resultSet == null) {
 						globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + r.message);
 					} else if (r.resultSet.length() != 1) {
-						globalTracer.debug("max commit id is missing in SyncLiteDB");				
-					} else {					
+						globalTracer.debug("max commit id is missing in SyncLiteDB");
+					} else {
 						JSONObject o = r.resultSet.getJSONObject(0);
-				        Iterator<String> keys = o.keys();
-				        if (keys.hasNext()) {
-				            String key = keys.next();
-				            deviceCommitID = o.getLong(key);
-				        }
-					}					
+						Iterator<String> keys = o.keys();
+						if (keys.hasNext()) {
+							String key = keys.next();
+							deviceCommitID = o.getLong(key);
+						}
+					}
 				} catch (SQLException e) {
 					deviceCommitID = 0;
-					globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + e.getMessage() ,e);
+					globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + e.getMessage(), e);
 				}
 
 				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
-
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
 				if (deviceCommitID == dstCommitID) {
@@ -906,19 +1286,12 @@ public class TestDriver implements Runnable{
 					waited += CONSOLIDATION_CHECK_INTERVAL;
 				}
 			}
-			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);			
+			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);
 		} catch (InterruptedException e) {
 			Thread.interrupted();
 		}
 	}
 
-	//=================================================
-	//
-	// Reads column definitions from JDBC metadata in the JSON format that
-	// dbreader's DBMetadataReader.readSrcSchema() produces.  This prevents
-	// false schema-drift detection on startup.
-	// Format: ["col1 TYPE1 NULL", "col2 TYPE2 NOT NULL", ...]
-	//
 	private final String readJdbcSchemaAsJson(Connection conn, String tableName) throws Exception {
 		DatabaseMetaData meta = conn.getMetaData();
 		StringBuilder sb = new StringBuilder("[");
@@ -991,7 +1364,7 @@ public class TestDriver implements Runnable{
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
 				try {
 					List<String> rows = dstDBReader.readRows(
-							"SELECT " + column + " FROM " + this.dstTablePrefix + table + " WHERE id = " + idValue);
+						"SELECT " + column + " FROM " + this.dstTablePrefix + table + " WHERE id = " + idValue);
 					if (!rows.isEmpty() && expected.equals(rows.get(0))) {
 						globalTracer.debug("Verified value '" + expected + "' in " + table + "." + column);
 						return;
@@ -1008,14 +1381,9 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-	//=================================================
-	//
-	//WRITE YOUR TESTS BELOW =========================>
-	//
-	//=================================================
-
 	private final void testSQLiteStmtBasic() throws SyncLiteTestException {		
 		String testName = "testSQLiteStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1033,14 +1401,14 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
-					stmt.execute("INSERT INTO tab1 VALUES(1, 1.1, '1', '1', '1')");
-					stmt.execute("INSERT INTO tab1 VALUES(2, 2.2, '2', '2', '2')");
-					stmt.execute("INSERT INTO tab1 VALUES(4, 4.4, '4', '4', '4')");
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1.1, '1', '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2.2, '2', '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4.4, '4', '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5', '5')");
 
-					stmt.execute("UPDATE tab1 SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3', col5 = '3' WHERE col1 = 4");
-					stmt.execute("DELETE FROM tab1 WHERE col1 = 5");
+					stmt.execute("UPDATE " + tableName + " SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3', col5 = '3' WHERE col1 = 4");
+					stmt.execute("DELETE FROM " + tableName + " WHERE col1 = 5");
 				}
 			}
 
@@ -1054,7 +1422,7 @@ public class TestDriver implements Runnable{
 			cols.add("col5");
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
-			verifyDataWithDevice(testName, DeviceType.SQLITE, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.SQLITE, testDBPath, tableName, cols, orderCols);
 
 			SQLite.closeDevice(testDBPath);
 
@@ -1069,6 +1437,7 @@ public class TestDriver implements Runnable{
 
 	private final void testSQLitePreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testSQLitePreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1086,9 +1455,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1 VALUES(?, ?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -1120,7 +1489,7 @@ public class TestDriver implements Runnable{
 					pstmt.executeBatch();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE tab1 SET col1 = ?, col2 = ?, col3 = ?, col4 = ?, col5 = ? WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE " + tableName + " SET col1 = ?, col2 = ?, col3 = ?, col4 = ?, col5 = ? WHERE col1 = ?")) {
 					pstmt.setInt(1, 3);
 					pstmt.setDouble(2, 3.3);
 					pstmt.setString(3, "3");
@@ -1131,7 +1500,7 @@ public class TestDriver implements Runnable{
 					pstmt.execute();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM " + tableName + " WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);					
 					pstmt.execute();
 				}
@@ -1149,7 +1518,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.SQLITE, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.SQLITE, testDBPath, tableName, cols, orderCols);
 
 			SQLite.closeDevice(testDBPath);
 
@@ -1387,6 +1756,7 @@ public class TestDriver implements Runnable{
 
 	private final void testDuckDBStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDuckDBStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1404,14 +1774,14 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 TEXT)");
-					stmt.execute("INSERT INTO tab1 VALUES(1, 1.1, '1', '1')");
-					stmt.execute("INSERT INTO tab1 VALUES(2, 2.2, '2', '2')");
-					stmt.execute("INSERT INTO tab1 VALUES(4, 4.4, '4', '4')");
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 TEXT)");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1.1, '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2.2, '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4.4, '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5')");
 
-					stmt.execute("UPDATE tab1 SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3' WHERE col1 = 4");
-					stmt.execute("DELETE FROM tab1 WHERE col1 = 5");
+					stmt.execute("UPDATE " + tableName + " SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3' WHERE col1 = 4");
+					stmt.execute("DELETE FROM " + tableName + " WHERE col1 = 5");
 				}
 			}
 
@@ -1424,7 +1794,7 @@ public class TestDriver implements Runnable{
 			cols.add("col4");
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
-			verifyDataWithDevice(testName, DeviceType.DUCKDB, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.DUCKDB, testDBPath, tableName, cols, orderCols);
 
 			DuckDB.closeDevice(testDBPath);
 
@@ -1439,6 +1809,7 @@ public class TestDriver implements Runnable{
 
 	private final void testDuckDBPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDuckDBPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1456,9 +1827,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 TEXT)");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 TEXT)");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1 VALUES(?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -1486,7 +1857,7 @@ public class TestDriver implements Runnable{
 					pstmt.executeBatch();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE tab1 SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE " + tableName + " SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
 					pstmt.setInt(1, 3);
 					pstmt.setDouble(2, 3.3);
 					pstmt.setString(3, "3");
@@ -1496,7 +1867,7 @@ public class TestDriver implements Runnable{
 					pstmt.execute();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM " + tableName + " WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
 
 					pstmt.execute();
@@ -1514,7 +1885,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.DUCKDB, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.DUCKDB, testDBPath, tableName, cols, orderCols);
 
 			DuckDB.closeDevice(testDBPath);
 
@@ -1675,6 +2046,7 @@ public class TestDriver implements Runnable{
 
 	private final void testDerbyStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDerbyStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1692,14 +2064,14 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
-					stmt.execute("INSERT INTO tab1 VALUES(1, 1.1, '1', '1')");
-					stmt.execute("INSERT INTO tab1 VALUES(2, 2.2, '2', '2')");
-					stmt.execute("INSERT INTO tab1 VALUES(4, 4.4, '4', '4')");
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1.1, '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2.2, '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4.4, '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5')");
 
-					stmt.execute("UPDATE tab1 SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3' WHERE col1 = 4");
-					stmt.execute("DELETE FROM tab1 WHERE col1 = 5");
+					stmt.execute("UPDATE " + tableName + " SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3' WHERE col1 = 4");
+					stmt.execute("DELETE FROM " + tableName + " WHERE col1 = 5");
 				}
 			}
 
@@ -1712,7 +2084,7 @@ public class TestDriver implements Runnable{
 			cols.add("col4");
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
-			verifyDataWithDevice(testName, DeviceType.DERBY, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.DERBY, testDBPath, tableName, cols, orderCols);
 
 			Derby.closeDevice(testDBPath);
 
@@ -1727,6 +2099,7 @@ public class TestDriver implements Runnable{
 
 	private final void testDerbyPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDerbyPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1744,9 +2117,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1 VALUES(?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -1774,7 +2147,7 @@ public class TestDriver implements Runnable{
 					pstmt.executeBatch();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE tab1 SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE " + tableName + " SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
 					pstmt.setInt(1, 3);
 					pstmt.setDouble(2, 3.3);
 					pstmt.setString(3, "3");
@@ -1784,7 +2157,7 @@ public class TestDriver implements Runnable{
 					pstmt.execute();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM " + tableName + " WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
 
 					pstmt.execute();
@@ -1802,7 +2175,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.DERBY, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.DERBY, testDBPath, tableName, cols, orderCols);
 
 			Derby.closeDevice(testDBPath);
 
@@ -1963,6 +2336,7 @@ public class TestDriver implements Runnable{
 
 	private final void testH2StmtBasic() throws SyncLiteTestException {		
 		String testName = "testH2StmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -1980,14 +2354,14 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
-					stmt.execute("INSERT INTO tab1 VALUES(1, 1.1, '1', '1')");
-					stmt.execute("INSERT INTO tab1 VALUES(2, 2.2, '2', '2')");
-					stmt.execute("INSERT INTO tab1 VALUES(4, 4.4, '4', '4')");
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1.1, '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2.2, '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4.4, '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5')");
 
-					stmt.execute("UPDATE tab1 SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3' WHERE col1 = 4");
-					stmt.execute("DELETE FROM tab1 WHERE col1 = 5");
+					stmt.execute("UPDATE " + tableName + " SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3' WHERE col1 = 4");
+					stmt.execute("DELETE FROM " + tableName + " WHERE col1 = 5");
 				}
 			}
 
@@ -2000,7 +2374,7 @@ public class TestDriver implements Runnable{
 			cols.add("col4");
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
-			verifyDataWithDevice(testName, DeviceType.H2, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.H2, testDBPath, tableName, cols, orderCols);
 
 			H2.closeDevice(testDBPath);
 
@@ -2015,6 +2389,7 @@ public class TestDriver implements Runnable{
 
 	private final void testH2PreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testH2PreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2032,9 +2407,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50), col4 VARCHAR(50))");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1 VALUES(?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2062,7 +2437,7 @@ public class TestDriver implements Runnable{
 					pstmt.executeBatch();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE tab1 SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE " + tableName + " SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
 					pstmt.setInt(1, 3);
 					pstmt.setDouble(2, 3.3);
 					pstmt.setString(3, "3");
@@ -2072,7 +2447,7 @@ public class TestDriver implements Runnable{
 					pstmt.execute();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tab1 WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM " + tableName + " WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
 
 					pstmt.execute();
@@ -2090,7 +2465,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.H2, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.H2, testDBPath, tableName, cols, orderCols);
 
 			H2.closeDevice(testDBPath);
 
@@ -2252,6 +2627,7 @@ public class TestDriver implements Runnable{
 
 	private final void testHyperSQLStmtBasic() throws SyncLiteTestException {		
 		String testName = "testHyperSQLStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2269,14 +2645,14 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tabHSQL(col1 INTEGER PRIMARY KEY, col2 INTEGER, col3 VARCHAR(50), col4 VARCHAR(50))");
-					stmt.execute("INSERT INTO tabHSQL VALUES(1, 1, '1', '1')");
-					stmt.execute("INSERT INTO tabHSQL VALUES(2, 2, '2', '2')");
-					stmt.execute("INSERT INTO tabHSQL VALUES(4, 4, '4', '4')");
-					stmt.execute("INSERT INTO tabHSQL VALUES(5, 5, '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 INTEGER, col3 VARCHAR(50), col4 VARCHAR(50))");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1, '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2, '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4, '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5, '5', '5')");
 
-					stmt.execute("UPDATE tabHSQL SET col1 = 3, col2 = 3, col3 = '3', col4 = '3' WHERE col1 = 4");
-					stmt.execute("DELETE FROM tabHSQL WHERE col1 = 5");
+					stmt.execute("UPDATE " + tableName + " SET col1 = 3, col2 = 3, col3 = '3', col4 = '3' WHERE col1 = 4");
+					stmt.execute("DELETE FROM " + tableName + " WHERE col1 = 5");
 				}
 			}
 
@@ -2289,7 +2665,7 @@ public class TestDriver implements Runnable{
 			cols.add("col4");
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
-			verifyDataWithDevice(testName, DeviceType.HYPERSQL, testDBPath, "tabHSQL", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.HYPERSQL, testDBPath, tableName, cols, orderCols);
 
 			HyperSQL.closeDevice(testDBPath);
 
@@ -2304,6 +2680,7 @@ public class TestDriver implements Runnable{
 
 	private final void testHyperSQLPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testHyperSQLPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2321,9 +2698,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tabHSQL(col1 INTEGER PRIMARY KEY, col2 INTEGER, col3 VARCHAR(50), col4 VARCHAR(50))");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 INTEGER, col3 VARCHAR(50), col4 VARCHAR(50))");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tabHSQL VALUES(?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1);
 					pstmt.setString(3, "1");
@@ -2351,7 +2728,7 @@ public class TestDriver implements Runnable{
 					pstmt.executeBatch();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE tabHSQL SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("UPDATE " + tableName + " SET col1 = ?, col2 = ?, col3 = ?, col4 = ? WHERE col1 = ?")) {
 					pstmt.setInt(1, 3);
 					pstmt.setDouble(2, 3);
 					pstmt.setString(3, "3");
@@ -2361,7 +2738,7 @@ public class TestDriver implements Runnable{
 					pstmt.execute();
 				}
 
-				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM tabHSQL WHERE col1 = ?")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("DELETE FROM " + tableName + " WHERE col1 = ?")) {
 					pstmt.setInt(1, 5);
 
 					pstmt.execute();
@@ -2379,7 +2756,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.HYPERSQL, testDBPath, "tabHSQL", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.HYPERSQL, testDBPath, tableName, cols, orderCols);
 
 			HyperSQL.closeDevice(testDBPath);
 
@@ -2537,15 +2914,17 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-	private final void testTelemetryPreparedStmtBasic() throws SyncLiteTestException {		
-		String testName = "testTelemetryPreparedStmtBasic";
+	private final void testSQLiteStorePreparedStmtBasic() throws SyncLiteTestException {		
+		String testName = "testSQLiteStorePreparedStmtBasic";
+		String tableName = testName;
+		String checkpointTableName = testName + "_dummy";
 
 		try {
 			preTest(testName);
 
 			Path testDBPath = dbDir.resolve(testName + ".db");			
-			Telemetry.initialize(testDBPath, loggerConfig, testName);
-			String testDBURL = "jdbc:synclite_telemetry:" + dbDir.resolve(testDBPath);
+			SQLiteStore.initialize(testDBPath, loggerConfig, testName);
+			String testDBURL = "jdbc:synclite_sqlite_store:" + dbDir.resolve(testDBPath);
 
 			//Test a basic scenario 
 			//1. create a table with an INTEGER, FLOATING POINT, TEXT and BLOB column
@@ -2556,9 +2935,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1Tel(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1Tel VALUES(?, ?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2593,11 +2972,11 @@ public class TestDriver implements Runnable{
 				//Execute this dummy DDL as it will update the checkpoint table 
 				//and make it possible to validate if consolidation has succeeded for telemetry device.
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE dummy(col1 int)");
+					stmt.execute("CREATE TABLE " + checkpointTableName + "(col1 int)");
 				}				
 			}
 
-			waitForConsolidation(testName, DeviceType.TELEMETRY, testDBPath);
+			waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
 
 			List<String> cols = new ArrayList<String>();
 			cols.add("col1");
@@ -2615,9 +2994,9 @@ public class TestDriver implements Runnable{
 			expectedRows.add("3|3.3|3|3|3");
 			expectedRows.add("4|4.4|4|4|4");
 
-			verifyData(expectedRows, "tab1Tel", cols, orderCols);
+			verifyData(expectedRows, tableName, cols, orderCols);
 
-			Telemetry.closeDevice(testDBPath);
+			SQLiteStore.closeDevice(testDBPath);
 
 			postTest(testName, "PASS");
 		} catch (Exception e) {
@@ -2629,6 +3008,8 @@ public class TestDriver implements Runnable{
 
 	private final void testStreamingPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testStreamingPreparedStmtBasic";
+		String tableName = testName;
+		String checkpointTableName = testName + "_dummy";
 
 		try {
 			preTest(testName);
@@ -2646,9 +3027,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1Stream(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1Stream VALUES(?, ?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2683,7 +3064,7 @@ public class TestDriver implements Runnable{
 				//Execute this dummy DDL as it will update the checkpoint table 
 				//and make it possible to validate if consolidation has succeeded for telemetry device.
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE dummy(col1 int)");
+					stmt.execute("CREATE TABLE " + checkpointTableName + "(col1 int)");
 				}				
 			}
 
@@ -2705,7 +3086,7 @@ public class TestDriver implements Runnable{
 			expectedRows.add("3|3.3|3|3|3");
 			expectedRows.add("4|4.4|4|4|4");
 
-			verifyData(expectedRows, "tab1Stream", cols, orderCols);
+			verifyData(expectedRows, tableName, cols, orderCols);
 
 			Streaming.closeDevice(testDBPath);
 
@@ -2717,8 +3098,284 @@ public class TestDriver implements Runnable{
 		}
 	}
 
+	private final void testSQLiteStoreAPIBasic() throws SyncLiteTestException {
+		String testName = "testSQLiteStoreAPIBasic";
+		String tableName = testName + "_tbl";
+
+		try {
+			preTest(testName);
+
+			Path testDBPath = dbDir.resolve(testName + ".db");
+			SQLiteStore.initialize(testDBPath, loggerConfig, testName);
+
+			try (SyncLiteStore store = SQLiteStore.open(testDBPath)) {
+				java.util.LinkedHashMap<String, String> colsDef = new java.util.LinkedHashMap<String, String>();
+				colsDef.put("id", "INTEGER PRIMARY KEY");
+				colsDef.put("name", "TEXT");
+				colsDef.put("score", "INTEGER");
+				store.createTable(tableName, colsDef);
+
+				store.insert(tableName, java.util.Map.of("id", 1, "name", "alice", "score", 100));
+				store.insert(tableName, java.util.Map.of("id", 2, "name", "bob", "score", 200));
+				store.update(tableName, java.util.Map.of("score", 150), java.util.Map.of("name", "alice"));
+				store.delete(tableName, java.util.Map.of("name", "bob"));
+
+				List<java.util.Map<String, Object>> batchRows = List.of(
+						java.util.Map.of("id", 3, "name", "carol", "score", 300),
+						java.util.Map.of("id", 4, "name", "dave", "score", 400));
+				store.insertBatch(tableName, batchRows);
+
+				store.updateBatch(tableName,
+						List.of(java.util.Map.of("score", 350), java.util.Map.of("score", 450)),
+						List.of(java.util.Map.of("name", "carol"), java.util.Map.of("name", "dave")));
+				store.deleteBatch(tableName, List.of(java.util.Map.of("name", "dave")));
+
+				store.insert(tableName, java.util.Map.of("id", 5, "name", "eve", "score", 500));
+
+				// Test rollback: rolled-back transaction must NOT appear in destination.
+				// Product bug: SyncLiteStore.rollback() currently does not suppress the log entry —
+				// the rolled-back row (id=99) is staged with a valid commit_id and replayed by the
+				// consolidator. If this test fails, use dumpStageDirCommandLog output to confirm.
+				store.setAutoCommit(false);
+				store.insert(tableName, java.util.Map.of("id", 99, "name", "temp", "score", 999));
+				store.rollback();
+				store.setAutoCommit(true);
+				globalTracer.info("[" + testName + "] Rolled back temp row (id=99). It must NOT appear in destination.");
+			}
+
+			try {
+				waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
+			} catch (SyncLiteTestException waitEx) {
+				globalTracer.error("[" + testName + "] waitForConsolidation timed out — dumping diagnostics");
+				dumpStageDirCommandLog(testName, 30);
+				dumpConsolidatorTrace(testName, 40);
+				throw waitEx;
+			}
+
+			List<String> cols = new ArrayList<String>();
+			cols.add("id");
+			cols.add("name");
+			cols.add("score");
+
+			List<String> orderCols = new ArrayList<String>();
+			orderCols.add("id");
+
+			// Expected: committed rows only. id=99 (rolled back) must be absent.
+			List<String> expectedRows = new ArrayList<String>();
+			expectedRows.add("1|alice|150");
+			expectedRows.add("3|carol|350");
+			expectedRows.add("5|eve|500");
+
+			verifyData(expectedRows, tableName, cols, orderCols);
+
+			SQLiteStore.closeDevice(testDBPath);
+
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			postTest(testName, "FAIL");
+		}
+	}
+
+	private final void testStreamingAPIBasic() throws SyncLiteTestException {
+		String testName = "testStreamingAPIBasic";
+		String tableName = testName + "_tbl";
+
+		try {
+			preTest(testName);
+
+			Path testDBPath = dbDir.resolve(testName + ".db");
+			Streaming.initialize(testDBPath, loggerConfig, testName);
+
+			try (SyncLiteStream stream = SyncLiteStream.open(testDBPath)) {
+				java.util.LinkedHashMap<String, String> colsDef = new java.util.LinkedHashMap<String, String>();
+				colsDef.put("id", "INTEGER PRIMARY KEY");
+				colsDef.put("event_type", "TEXT");
+				colsDef.put("user_name", "TEXT");
+				stream.createTable(tableName, colsDef);
+
+				List<java.util.Map<String, Object>> batchRows = List.of(
+						java.util.Map.of("id", 1, "event_type", "click", "user_name", "alice"),
+						java.util.Map.of("id", 2, "event_type", "view", "user_name", "bob"),
+						java.util.Map.of("id", 3, "event_type", "purchase", "user_name", "carol"));
+				stream.insertBatch(tableName, batchRows);
+			}
+
+			waitForConsolidation(testName, DeviceType.STREAMING, testDBPath);
+
+			List<String> cols = new ArrayList<String>();
+			cols.add("id");
+			cols.add("event_type");
+			cols.add("user_name");
+
+			List<String> orderCols = new ArrayList<String>();
+			orderCols.add("id");
+
+			List<String> expectedRows = new ArrayList<String>();
+			expectedRows.add("1|click|alice");
+			expectedRows.add("2|view|bob");
+			expectedRows.add("3|purchase|carol");
+
+			verifyData(expectedRows, tableName, cols, orderCols);
+
+			Streaming.closeDevice(testDBPath);
+
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			postTest(testName, "FAIL");
+		}
+	}
+
+	private final void testJedisAPIBasic() throws SyncLiteTestException {
+		String testName = "testJedisAPIBasic";
+		String keyPrefix = testName + ":";
+		com.github.fppt.jedismock.RedisServer redisServer = null;
+
+		try {
+			preTest(testName);
+
+			Path testDBPath = dbDir.resolve(testName + ".db");
+			SQLiteStore.initialize(testDBPath, loggerConfig, testName);
+
+			redisServer = com.github.fppt.jedismock.RedisServer.newRedisServer();
+			redisServer.start();
+
+			String redisHost = redisServer.getHost();
+			int redisPort = redisServer.getBindPort();
+
+			try (SyncLiteStore store = SQLiteStore.open(testDBPath);
+					Jedis jedis = Jedis.builder(store).host(redisHost).port(redisPort).build()) {
+				jedis.set(keyPrefix + "k1", "v1");
+				jedis.rpush(keyPrefix + "list1", "a", "b");
+				// Test hash operations — jedis_hashes has composite PK (hash_key, field).
+				// Known issue: consolidator throws "table has more than one primary key" when
+				// seeding in-memory replica for jedis_hashes. dumpConsolidatorTrace will capture
+				// the exact exception if waitForConsolidation times out.
+				jedis.hset(keyPrefix + "hash1", "field1", "value1");
+				jedis.hset(keyPrefix + "hash1", "field2", "value2");
+			}
+
+			try {
+				waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
+			} catch (SyncLiteTestException waitEx) {
+				globalTracer.error("[" + testName + "] waitForConsolidation timed out — dumping diagnostics");
+				dumpStageDirCommandLog(testName, 30);
+				dumpConsolidatorTrace(testName, 60);
+				throw waitEx;
+			}
+
+			List<String> stringCols = new ArrayList<String>();
+			stringCols.add("key");
+			stringCols.add("value");
+
+			List<String> listCols = new ArrayList<String>();
+			listCols.add("key");
+			listCols.add("idx");
+			listCols.add("value");
+
+			List<String> hashCols = new ArrayList<String>();
+			hashCols.add("hash_key");
+			hashCols.add("field");
+			hashCols.add("value");
+
+			List<String> orderByKey = new ArrayList<String>();
+			orderByKey.add("key");
+
+			List<String> orderByList = new ArrayList<String>();
+			orderByList.add("key");
+			orderByList.add("idx");
+
+			List<String> orderByHash = new ArrayList<String>();
+			orderByHash.add("hash_key");
+			orderByHash.add("field");
+
+			List<String> expectedStringRows = new ArrayList<String>();
+			expectedStringRows.add(keyPrefix + "k1|v1");
+
+			List<String> expectedListRows = new ArrayList<String>();
+			expectedListRows.add(keyPrefix + "list1|0|a");
+			expectedListRows.add(keyPrefix + "list1|1|b");
+
+			List<String> expectedHashRows = new ArrayList<String>();
+			expectedHashRows.add(keyPrefix + "hash1|field1|value1");
+			expectedHashRows.add(keyPrefix + "hash1|field2|value2");
+
+			verifyData(expectedStringRows, "jedis_strings", stringCols, orderByKey);
+			verifyData(expectedListRows, "jedis_lists", listCols, orderByList);
+			verifyData(expectedHashRows, "jedis_hashes", hashCols, orderByHash);
+
+			SQLiteStore.closeDevice(testDBPath);
+
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			postTest(testName, "FAIL");
+		} finally {
+			if (redisServer != null) {
+				try {
+					redisServer.stop();
+				} catch (Exception ignored) {
+				}
+			}
+		}
+	}
+
+	private final void testKafkaProducerAPIBasic() throws SyncLiteTestException {
+		String testName = "testKafkaProducerAPIBasic";
+		String topicName = testName + "_topic";
+		String kafkaDeviceName = "default";
+
+		try {
+			preTest(testName);
+
+			Path testDBDir = dbDir.resolve(testName);
+			Files.createDirectories(testDBDir);
+
+			Properties props = new Properties();
+			props.setProperty("device-path", testDBDir.toString());
+			props.setProperty("device-name", testName);
+			props.setProperty("local-data-stage-directory", stageDir.toString());
+			props.setProperty("destination-type", "FS");
+
+			try (KafkaProducer producer = new KafkaProducer(props)) {
+				producer.send(new org.apache.kafka.clients.producer.ProducerRecord<String, String>(topicName, "k1", "v1")).get();
+				producer.send(new org.apache.kafka.clients.producer.ProducerRecord<String, String>(topicName, "k2", "v2")).get();
+				producer.send(new org.apache.kafka.clients.producer.ProducerRecord<String, String>(topicName, "k3", "v3")).get();
+				producer.flush();
+			}
+
+			Path deviceFilePath = testDBDir.resolve("default.db");
+			waitForConsolidation(kafkaDeviceName, DeviceType.STREAMING, deviceFilePath);
+
+			List<String> cols = new ArrayList<String>();
+			cols.add("key");
+			cols.add("value");
+
+			List<String> orderCols = new ArrayList<String>();
+			orderCols.add("key");
+
+			List<String> expectedRows = new ArrayList<String>();
+			expectedRows.add("k1|v1");
+			expectedRows.add("k2|v2");
+			expectedRows.add("k3|v3");
+
+			verifyData(expectedRows, topicName, cols, orderCols);
+
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			postTest(testName, "FAIL");
+		}
+	}
+
 	private final void testSQLiteAppenderPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testSQLiteAppenderPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2736,9 +3393,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1SQLiteAppender(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1SQLiteAppender VALUES(?, ?, ?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2783,7 +3440,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.SQLITE_APPENDER, testDBPath,  "tab1SQLiteAppender", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.SQLITE_APPENDER, testDBPath, tableName, cols, orderCols);
 
 			SQLiteAppender.closeDevice(testDBPath);
 
@@ -2797,6 +3454,7 @@ public class TestDriver implements Runnable{
 
 	private final void testDuckDBAppenderPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDuckDBAppenderPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2814,9 +3472,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1DuckDBAppender(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT)");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT)");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1DuckDBAppender VALUES(?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2851,7 +3509,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.DUCKDB_APPENDER, testDBPath,  "tab1DuckDBAppender", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.DUCKDB_APPENDER, testDBPath, tableName, cols, orderCols);
 
 			DuckDBAppender.closeDevice(testDBPath);
 
@@ -2865,6 +3523,7 @@ public class TestDriver implements Runnable{
 
 	private final void testDerbyAppenderPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testDerbyAppenderPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2882,9 +3541,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1DerbyAppender(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50))");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50))");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1DerbyAppender VALUES(?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2919,7 +3578,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.DERBY_APPENDER, testDBPath,  "tab1DerbyAppender", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.DERBY_APPENDER, testDBPath, tableName, cols, orderCols);
 
 			DerbyAppender.closeDevice(testDBPath);
 
@@ -2933,6 +3592,7 @@ public class TestDriver implements Runnable{
 
 	private final void testH2AppenderPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testH2AppenderPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -2950,9 +3610,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1H2Appender(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50))");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 VARCHAR(50))");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1H2Appender VALUES(?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1.1);
 					pstmt.setString(3, "1");
@@ -2987,7 +3647,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.H2_APPENDER, testDBPath,  "tab1H2Appender", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.H2_APPENDER, testDBPath, tableName, cols, orderCols);
 
 			H2Appender.closeDevice(testDBPath);
 
@@ -3001,6 +3661,7 @@ public class TestDriver implements Runnable{
 
 	private final void testHyperSQLAppenderPreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testHyperSQLAppenderPreparedStmtBasic";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -3018,9 +3679,9 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1HyperSQLAppender(col1 INTEGER PRIMARY KEY, col2 INTEGER, col3 VARCHAR(50))");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 INTEGER, col3 VARCHAR(50))");
 				}
-				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO tab1HyperSQLAppender VALUES(?, ?, ?)")) {
+				try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO " + tableName + " VALUES(?, ?, ?)")) {
 					pstmt.setInt(1, 1);
 					pstmt.setDouble(2, 1);
 					pstmt.setString(3, "1");
@@ -3055,7 +3716,7 @@ public class TestDriver implements Runnable{
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
 
-			verifyDataWithDevice(testName, DeviceType.HYPERSQL_APPENDER, testDBPath,  "tab1HyperSQLAppender", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.HYPERSQL_APPENDER, testDBPath, tableName, cols, orderCols);
 
 			HyperSQLAppender.closeDevice(testDBPath);
 
@@ -3236,15 +3897,15 @@ public class TestDriver implements Runnable{
 	}
 
 
-	private final void testTelemetryFatTableAutoArgInlining() throws SyncLiteTestException {
-		String testName = "testTelemetryFatTableAutoArgInlining";
+	private final void testSQLiteStoreFatTableAutoArgInlining() throws SyncLiteTestException {
+		String testName = "testSQLiteStoreFatTableAutoArgInlining";
 
 		try {
 			preTest(testName);
 
 			Path testDBPath = dbDir.resolve(testName + ".db");			
-			Telemetry.initialize(testDBPath, loggerConfig, testName);
-			String testDBURL = "jdbc:synclite_telemetry:" + dbDir.resolve(testDBPath);
+			SQLiteStore.initialize(testDBPath, loggerConfig, testName);
+			String testDBURL = "jdbc:synclite_sqlite_store:" + dbDir.resolve(testDBPath);
 
 			//Test a basic scenario 
 			//1. create a table with an INTEGER, FLOATING POINT, TEXT and BLOB column
@@ -3311,11 +3972,11 @@ public class TestDriver implements Runnable{
 				//Execute this dummy DDL as it will update the checkpoint table 
 				//and make it possible to validate if consolidation has succeeded for telemetry device.
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE dummy(col1 int)");
+					stmt.execute("CREATE TABLE " + testName + "_dummy(col1 int)");
 				}
 			}
 
-			waitForConsolidation(testName, DeviceType.TELEMETRY, testDBPath);
+			waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
 
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
@@ -3347,7 +4008,7 @@ public class TestDriver implements Runnable{
 
 			verifyData(expectedRows, testName, cols, orderCols);
 
-			Telemetry.closeDevice(testDBPath);
+			SQLiteStore.closeDevice(testDBPath);
 
 			postTest(testName, "PASS");
 		} catch (Exception e) {
@@ -3357,8 +4018,8 @@ public class TestDriver implements Runnable{
 		}
 	}
 
-	private final void testTelemetryFatTableFixedInlinedArgs() throws SyncLiteTestException {
-		String testName = "testTelemetryFatTableFixedInlinedArgs";
+	private final void testSQLiteStoreFatTableFixedInlinedArgs() throws SyncLiteTestException {
+		String testName = "testSQLiteStoreFatTableFixedInlinedArgs";
 
 		try {
 			preTest(testName);
@@ -3368,8 +4029,8 @@ public class TestDriver implements Runnable{
 			options.setDeviceName(testName);
 
 			Path testDBPath = dbDir.resolve(testName + ".db");			
-			Telemetry.initialize(testDBPath, options);
-			String testDBURL = "jdbc:synclite_telemetry:" + dbDir.resolve(testDBPath);
+			SQLiteStore.initialize(testDBPath, options);
+			String testDBURL = "jdbc:synclite_sqlite_store:" + dbDir.resolve(testDBPath);
 
 			//Test a basic scenario 
 			//1. create a table with an INTEGER, FLOATING POINT, TEXT and BLOB column
@@ -3425,12 +4086,12 @@ public class TestDriver implements Runnable{
 				//Execute this dummy DDL as it will update the checkpoint table 
 				//and make it possible to validate if consolidation has succeeded for telemetry device.
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE dummy(col1 int)");
+					stmt.execute("CREATE TABLE " + testName + "_dummy(col1 int)");
 				}				
 
 			}
 
-			waitForConsolidation(testName, DeviceType.TELEMETRY, testDBPath);
+			waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
 
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
@@ -3462,7 +4123,7 @@ public class TestDriver implements Runnable{
 
 			verifyData(expectedRows, testName, cols, orderCols);
 
-			Telemetry.closeDevice(testDBPath);
+			SQLiteStore.closeDevice(testDBPath);
 
 			postTest(testName, "PASS");
 		} catch (Exception e) {
@@ -3661,7 +4322,7 @@ public class TestDriver implements Runnable{
 			Class.forName("io.synclite.logger.H2Appender");
 			Class.forName("io.synclite.logger.HyperSQL");
 			Class.forName("io.synclite.logger.HyperSQLAppender");			
-			Class.forName("io.synclite.logger.Telemetry");
+			Class.forName("io.synclite.logger.SQLiteStore");
 			Class.forName("io.synclite.logger.Streaming");
 			runTests();
 			stopJobs();
@@ -3675,6 +4336,7 @@ public class TestDriver implements Runnable{
 
 	private final void testSQLiteCallback() throws SyncLiteTestException {		
 		String testName = "testSQLiteCallback";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -3694,11 +4356,11 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
-					stmt.execute("INSERT INTO tab1 VALUES(1, 1.1, '1', '1', '1')");
-					stmt.execute("INSERT INTO tab1 VALUES(2, 2.2, '2', '2', '2')");
-					stmt.execute("INSERT INTO tab1 VALUES(4, 4.4, '4', '4', '4')");
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1.1, '1', '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2.2, '2', '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4.4, '4', '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5', '5')");
 				}
 			}
 
@@ -3754,154 +4416,42 @@ public class TestDriver implements Runnable{
 	}
 
 
-	private final void testDBReaderReplication() throws SyncLiteTestException {
-		String testName = "testDBReaderReplication";
-		String fatTable = "fat_table";
+	private final void testDBReader() throws SyncLiteTestException {
+		String testName = "testDBReader";
+		String dbReaderTable = "dbreadertable";
+		Path runtimeConsolidatorConfigPath = this.workDir.resolve("synclite_consolidator.conf");
+		String idempotentPropertyName = "dst-idempotent-data-ingestion-1";
+		boolean idempotencyToggled = false;
 
-		// Skip if dbreader script is not deployed alongside consolidator
-		Path dbreaderScript = this.corePath.resolve(isWindows() ? "synclite-dbreader.bat" : "synclite-dbreader.sh");
-		if (!Files.exists(dbreaderScript)) {
-			globalTracer.debug("Skipping " + testName + ": dbreader script not found at " + dbreaderScript);
+		if (!this.dbreaderEnabled) {
+			globalTracer.debug("Skipping " + testName + ": dbreader not started");
 			return;
 		}
-
-		Path dbreaderTestRoot   = this.workDir.resolve("dbreader_test");
-		Path dbreaderDbDir      = dbreaderTestRoot.resolve("db");
-		Path dbreaderSrcDbDir   = dbreaderTestRoot.resolve("srcDb");
-		Path dbreaderSrcDbPath  = dbreaderSrcDbDir.resolve("source.db");
-		Path dbreaderConfigPath = dbreaderDbDir.resolve("synclite_dbreader.conf");
-		Path dbreaderMetaDbPath = dbreaderDbDir.resolve("synclite_dbreader_metadata.db");
-		Path dbreaderLoggerConf = dbreaderDbDir.resolve("synclite_logger.conf");
 
 		try {
 			preTest(testName);
 
-			// ── directory layout ─────────────────────────────────────────────
-			Files.createDirectories(dbreaderDbDir);
-			Files.createDirectories(dbreaderSrcDbDir);
-
-			// ── source SQLite: fat_table ─────────────────────────────────────
-			// Covers all SQLite data-type categories.  is_deleted + updated_at
-			// drive incremental tracking and soft-delete detection.
-			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
-					Statement stmt = conn.createStatement()) {
-				stmt.execute(
-					"CREATE TABLE " + fatTable + " (" +
-					"id INTEGER PRIMARY KEY, " +
-					"col_text TEXT, " +
-					"col_varchar VARCHAR(100), " +
-					"col_int INTEGER, " +
-					"col_smallint SMALLINT, " +
-					"col_bigint BIGINT, " +
-					"col_real REAL, " +
-					"col_double DOUBLE, " +
-					"col_float FLOAT, " +
-					"col_numeric NUMERIC(10,2), " +
-					"col_decimal DECIMAL(8,4), " +
-					"col_boolean BOOLEAN, " +
-					"col_date DATE, " +
-					"col_datetime DATETIME, " +
-					"col_timestamp TIMESTAMP, " +
-					"col_blob BLOB, " +
-					"col_clob CLOB, " +
-					"is_deleted INTEGER DEFAULT 0, " +
-					"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
-				// Row 1 — kept unchanged through the test
-				stmt.execute(
-					"INSERT INTO " + fatTable + " VALUES(" +
-					"1,'hello','varchar_1',10,2,9000000000,1.1,2.2,3.3,12.34,56.78," +
-					"1,'2025-01-01','2025-01-01 10:00:00','2025-01-01 10:00:00'," +
-					"X'DEADBEEF','clob1',0,'2025-01-01 00:00:01')");
-				// Row 2 — will be UPDATE-d in Phase 2
-				stmt.execute(
-					"INSERT INTO " + fatTable + " VALUES(" +
-					"2,'world','varchar_2',20,4,8000000000,4.4,5.5,6.6,78.90,12.34," +
-					"0,'2025-02-01','2025-02-01 11:00:00','2025-02-01 11:00:00'," +
-					"X'CAFEBABE','clob2',0,'2025-01-01 00:00:02')");
-				// Row 3 — will be soft-DELETE-d in Phase 3
-				stmt.execute(
-					"INSERT INTO " + fatTable + " VALUES(" +
-					"3,'test','varchar_3',30,6,7000000000,7.7,8.8,9.9,11.22,33.44," +
-					"1,'2025-03-01','2025-03-01 12:00:00','2025-03-01 12:00:00'," +
-					"X'BEEFDEAD','clob3',0,'2025-01-01 00:00:03')");
+			// The dbreader incremental flow emits INSERT records for changed rows.
+			// In consolidation mode this can cause PK conflicts unless idempotent ingestion is enabled.
+			if (Files.exists(runtimeConsolidatorConfigPath)) {
+				upsertConfigProperty(runtimeConsolidatorConfigPath, idempotentPropertyName, "true");
+				restartSyncConsolidatorJob();
+				waitForConsolidationStartup();
+				idempotencyToggled = true;
+			} else {
+				globalTracer.debug("Skipping idempotency toggle in " + testName + ": config file missing at " + runtimeConsolidatorConfigPath);
 			}
-
-			// ── logger config (used by dbreader to stage SyncLite devices) ───
-			Files.writeString(dbreaderLoggerConf,
-				"local-data-stage-directory = " + this.stageDir + "\n" +
-				"local-command-stage-directory = " + this.commandDir + "\n" +
-				"destination-type = FS\n");
-
-			// ── dbreader config ───────────────────────────────────────────────
-			Files.writeString(dbreaderConfigPath,
-				"synclite-device-dir = " + dbreaderDbDir + "\n" +
-				"synclite-logger-configuration-file = " + dbreaderLoggerConf + "\n" +
-				"src-type = SQLITE\n" +
-				"src-connection-string = jdbc:sqlite:" + dbreaderSrcDbPath + "\n" +
-				"src-connection-timeout-s = 30\n" +
-				"src-dbreader-interval-s = 2\n" +
-				"src-dbreader-batch-size = 100000\n" +
-				"src-dbreader-processors = 1\n" +
-				"src-dbreader-method = INCREMENTAL\n" +
-				"dbreader-stop-after-first-iteration = false\n" +
-				"src-object-type = TABLE\n" +
-				"src-default-unique-key-column-list = id\n" +
-				"src-default-incremental-key-column-list = updated_at\n" +
-				"src-timestamp-incremental-key-initial-value = 0001-01-01 00:00:00\n" +
-				"src-default-soft-delete-condition = is_deleted = 1\n" +
-				"src-infer-schema-changes = true\n" +
-				"src-infer-object-drop = true\n" +
-				"dbreader-trace-level = DEBUG\n" +
-				"dbreader-update-statistics-interval-s = 5\n" +
-				"dbreader-enable-statistics-collector = true\n" +
-				"edition = DEVELOPER\n");
-
-			// ── dbreader metadata DB ─────────────────────────────────────────
-			// Register fat_table so dbreader knows which table to read and which
-			// columns drive incremental tracking and soft-delete detection.
-			// The allowed_columns JSON must match JDBC metadata exactly to avoid
-			// false schema-drift on startup.
-			try (Connection metaConn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderMetaDbPath);
-					Statement metaStmt = metaConn.createStatement()) {
-				metaStmt.execute(
-					"CREATE TABLE IF NOT EXISTS src_object_info(" +
-					"object_name TEXT PRIMARY KEY, object_type TEXT, " +
-					"allowed_columns TEXT, unique_key_columns TEXT, " +
-					"incremental_key_columns TEXT, group_name TEXT, " +
-					"group_position INTEGER, mask_columns TEXT, " +
-					"delete_condition TEXT, select_conditions TEXT, enable INTEGER)");
-				metaStmt.execute(
-					"CREATE TABLE IF NOT EXISTS src_object_reload_configurations(" +
-					"object_name TEXT PRIMARY KEY, " +
-					"reload_schema_on_next_restart INT, reload_schema_on_each_restart INT, " +
-					"reload_object_on_next_restart INT, reload_object_on_each_restart INT)");
-
-				String allowedCols;
-				try (Connection srcConn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath)) {
-					allowedCols = readJdbcSchemaAsJson(srcConn, fatTable);
-				}
-				metaStmt.execute(
-					"INSERT INTO src_object_info VALUES('" + fatTable + "','TABLE','" +
-					allowedCols.replace("'", "''") + "'," +
-					"'id','updated_at','',1,'','is_deleted = 1','',1)");
-				metaStmt.execute(
-					"INSERT INTO src_object_reload_configurations VALUES('" +
-					fatTable + "',0,0,0,0)");
-			}
-
-			// ── start dbreader (consolidator is already running) ─────────────
-			startDBReaderJob(dbreaderDbDir, dbreaderConfigPath);
 
 			// ── Phase 1: 3 initial rows replicated ───────────────────────────
-			waitForDbreaderReplicationRowCount(fatTable, 3);
+			waitForDbreaderReplicationRowCount(dbReaderTable, 3);
 			// Spot-check key columns on row id=1
 			List<String> colText = dstDBReader.readRows(
-					"SELECT col_text FROM " + this.dstTablePrefix + fatTable + " WHERE id = 1");
+					"SELECT col_text FROM " + this.dstTablePrefix + dbReaderTable + " WHERE id = 1");
 			if (colText.isEmpty() || !"hello".equals(colText.get(0))) {
 				throw new SyncLiteTestException("Phase 1: expected col_text='hello' for id=1, got: " + colText);
 			}
 			List<String> colBigint = dstDBReader.readRows(
-					"SELECT col_bigint FROM " + this.dstTablePrefix + fatTable + " WHERE id = 1");
+					"SELECT col_bigint FROM " + this.dstTablePrefix + dbReaderTable + " WHERE id = 1");
 			if (colBigint.isEmpty() || !"9000000000".equals(colBigint.get(0))) {
 				throw new SyncLiteTestException("Phase 1: expected col_bigint=9000000000 for id=1, got: " + colBigint);
 			}
@@ -3910,14 +4460,14 @@ public class TestDriver implements Runnable{
 			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
 					Statement stmt = conn.createStatement()) {
 				stmt.execute(
-					"UPDATE " + fatTable + " SET " +
+					"UPDATE " + dbReaderTable + " SET " +
 					"col_text = 'updated', col_int = 999, col_real = 9.99, " +
 					"col_boolean = 0, col_clob = 'updated_clob', " +
 					"updated_at = '2025-04-01 00:00:10' WHERE id = 2");
 			}
-			waitForDbreaderReplicationValue(fatTable, "col_text", "2", "updated");
+			waitForDbreaderReplicationValue(dbReaderTable, "col_text", "2", "updated");
 			List<String> colInt = dstDBReader.readRows(
-					"SELECT col_int FROM " + this.dstTablePrefix + fatTable + " WHERE id = 2");
+					"SELECT col_int FROM " + this.dstTablePrefix + dbReaderTable + " WHERE id = 2");
 			if (colInt.isEmpty() || !"999".equals(colInt.get(0))) {
 				throw new SyncLiteTestException("Phase 2: expected col_int=999 for id=2, got: " + colInt);
 			}
@@ -3926,12 +4476,12 @@ public class TestDriver implements Runnable{
 			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
 					Statement stmt = conn.createStatement()) {
 				stmt.execute(
-					"UPDATE " + fatTable + " SET " +
+					"UPDATE " + dbReaderTable + " SET " +
 					"is_deleted = 1, updated_at = '2025-05-01 00:00:20' WHERE id = 3");
 			}
-			waitForDbreaderReplicationRowCount(fatTable, 2);
+			waitForDbreaderReplicationRowCount(dbReaderTable, 2);
 			List<String> remainingIds = dstDBReader.readRows(
-					"SELECT id FROM " + this.dstTablePrefix + fatTable + " ORDER BY id");
+					"SELECT id FROM " + this.dstTablePrefix + dbReaderTable + " ORDER BY id");
 			if (remainingIds.size() != 2 || !"1".equals(remainingIds.get(0)) || !"2".equals(remainingIds.get(1))) {
 				throw new SyncLiteTestException("Phase 3: expected rows id=1,2 after soft-delete, got: " + remainingIds);
 			}
@@ -3943,11 +4493,61 @@ public class TestDriver implements Runnable{
 			globalTracer.error("Details : " + e.getMessage(), e);
 			try { stopDBReaderJob(); } catch (Exception ignored) {}
 			postTest(testName, "FAIL");
+		} finally {
+			if (idempotencyToggled) {
+				try {
+					upsertConfigProperty(runtimeConsolidatorConfigPath, idempotentPropertyName, "false");
+					restartSyncConsolidatorJob();
+					waitForConsolidationStartup();
+				} catch (Exception restoreEx) {
+					globalTracer.error("Failed to restore consolidator idempotency setting after " + testName + " : " + restoreEx.getMessage(), restoreEx);
+				}
+			}
+		}
+	}
+
+	private final void restartSyncConsolidatorJob() throws SyncLiteTestException {
+		stopConsolidatorJob();
+		waitForConsolidatorJobToStop();
+		startSyncConsolidatorJob();
+	}
+
+	private final void upsertConfigProperty(Path configPath, String propertyName, String propertyValue) throws SyncLiteTestException {
+		try {
+			List<String> lines = Files.readAllLines(configPath);
+			String normalizedPropertyName = propertyName.trim().toLowerCase();
+			boolean updated = false;
+			for (int i = 0; i < lines.size(); ++i) {
+				String line = lines.get(i);
+				String trimmed = line.trim();
+				if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+					continue;
+				}
+				int sep = line.indexOf('=');
+				if (sep <= 0) {
+					continue;
+				}
+				String key = line.substring(0, sep).trim().toLowerCase();
+				if (normalizedPropertyName.equals(key)) {
+					lines.set(i, propertyName + " = " + propertyValue);
+					updated = true;
+					break;
+				}
+			}
+
+			if (!updated) {
+				lines.add(propertyName + " = " + propertyValue);
+			}
+
+			Files.write(configPath, lines);
+		} catch (Exception e) {
+			throw new SyncLiteTestException("Failed to update consolidator config property " + propertyName + " in file : " + configPath, e);
 		}
 	}
 
 	private final void testSQLiteReinitializeDevice() throws SyncLiteTestException {		
 		String testName = "testSQLiteReinitializeDevice";
+		String tableName = testName;
 
 		try {
 			preTest(testName);
@@ -3965,14 +4565,14 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE tab1(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
-					stmt.execute("INSERT INTO tab1 VALUES(1, 1.1, '1', '1', '1')");
-					stmt.execute("INSERT INTO tab1 VALUES(2, 2.2, '2', '2', '2')");
-					stmt.execute("INSERT INTO tab1 VALUES(4, 4.4, '4', '4', '4')");
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5', '5')");
+					stmt.execute("CREATE TABLE " + tableName + "(col1 INTEGER PRIMARY KEY, col2 DOUBLE, col3 TEXT, col4 CLOB, col5 BLOB)");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(1, 1.1, '1', '1', '1')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(2, 2.2, '2', '2', '2')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(4, 4.4, '4', '4', '4')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5', '5')");
 
-					stmt.execute("UPDATE tab1 SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3', col5 = '3' WHERE col1 = 4");
-					stmt.execute("DELETE FROM tab1 WHERE col1 = 5");
+					stmt.execute("UPDATE " + tableName + " SET col1 = 3, col2 = 3.3, col3 = '3', col4 = '3', col5 = '3' WHERE col1 = 4");
+					stmt.execute("DELETE FROM " + tableName + " WHERE col1 = 5");
 				}
 			}
 
@@ -3986,7 +4586,7 @@ public class TestDriver implements Runnable{
 			cols.add("col5");
 			List<String> orderCols = new ArrayList<String>();
 			orderCols.add("col1");
-			verifyDataWithDevice(testName, DeviceType.SQLITE,testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.SQLITE,testDBPath, tableName, cols, orderCols);
 
 
 			//Stop job			
@@ -4004,13 +4604,13 @@ public class TestDriver implements Runnable{
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("INSERT INTO tab1 VALUES(5, 5.5, '5', '5', '5')");
+					stmt.execute("INSERT INTO " + tableName + " VALUES(5, 5.5, '5', '5', '5')");
 				}
 			}
 
 			waitForConsolidation(testName, DeviceType.SQLITE, testDBPath);
 
-			verifyDataWithDevice(testName, DeviceType.SQLITE, testDBPath, "tab1", cols, orderCols);
+			verifyDataWithDevice(testName, DeviceType.SQLITE, testDBPath, tableName, cols, orderCols);
 
 			SQLite.closeDevice(testDBPath);
 
@@ -4080,15 +4680,15 @@ public class TestDriver implements Runnable{
 		}		
 	}
 
-	private final void testTelemetryInsertWithColList() throws SyncLiteTestException {		
-		String testName = "testTelemetryInsertWithColList";
-		String tabName = "testTelemetryInsertWithColList";
+	private final void testSQLiteStoreInsertWithColList() throws SyncLiteTestException {		
+		String testName = "testSQLiteStoreInsertWithColList";
+		String tabName = "testSQLiteStoreInsertWithColList";
 		try {
 			preTest(testName);
 
 			Path testDBPath = dbDir.resolve(testName + ".db");			
-			Telemetry.initialize(testDBPath, loggerConfig, testName);
-			String testDBURL = "jdbc:synclite_telemetry:" + dbDir.resolve(testDBPath);
+			SQLiteStore.initialize(testDBPath, loggerConfig, testName);
+			String testDBURL = "jdbc:synclite_sqlite_store:" + dbDir.resolve(testDBPath);
 
 			try (Connection conn = DriverManager.getConnection(testDBURL)) {
 				try (Statement stmt = conn.createStatement()) {
@@ -4135,11 +4735,11 @@ public class TestDriver implements Runnable{
 				//Execute this dummy DDL as it will update the checkpoint table 
 				//and make it possible to validate if consolidation has succeeded for telemetry device.
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE dummy(col1 int)");
+					stmt.execute("CREATE TABLE " + testName + "_dummy(col1 int)");
 				}				
 			}
 
-			waitForConsolidation(testName, DeviceType.TELEMETRY, testDBPath);
+			waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
 
 			List<String> cols = new ArrayList<String>();
 			cols.add("col1");
@@ -4159,7 +4759,7 @@ public class TestDriver implements Runnable{
 
 			verifyData(expectedRows, tabName, cols, orderCols);
 
-			Telemetry.closeDevice(testDBPath);
+			SQLiteStore.closeDevice(testDBPath);
 
 			postTest(testName, "PASS");
 		} catch (Exception e) {
@@ -4225,7 +4825,7 @@ public class TestDriver implements Runnable{
 				//Execute this dummy DDL as it will update the checkpoint table 
 				//and make it possible to validate if consolidation has succeeded for telemetry device.
 				try (Statement stmt = conn.createStatement()) {
-					stmt.execute("CREATE TABLE dummy(col1 int)");
+					stmt.execute("CREATE TABLE " + testName + "_dummy(col1 int)");
 				}				
 			}
 
@@ -4304,14 +4904,14 @@ public class TestDriver implements Runnable{
 	}
 
 	private void testSyncLiteDB(String testName, DeviceType deviceType) throws SyncLiteTestException {
-		Path testDBPath = dbDir.resolve(testName + ".db");
+		Path testDBPath = dbDir.resolve(testName);
 		try {			
 			preTest(testName);
 			//Initialize DB
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting initialize DB"); 
 			globalTracer.debug("========================================================");
-			SyncLiteDBResult r = initializeDB(testDBPath, deviceType.toString(), testName, loggerConfig);
+			SyncLiteDBResult r = initializeDB(testName, deviceType.toString(), testName, loggerConfig);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 
@@ -4325,7 +4925,7 @@ public class TestDriver implements Runnable{
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting begin transaction"); 
 			globalTracer.debug("========================================================");
-			r = beginTransaction(testDBPath);
+			r = beginTransaction(testName);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			globalTracer.debug("txn-handle: " + r.txnHandle);
@@ -4339,7 +4939,7 @@ public class TestDriver implements Runnable{
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting create table"); 
 			globalTracer.debug("========================================================");
-			r = executeSQL(testDBPath, txnHandle, "create table "  + testName + "(a int, b varchar(50))", null);
+			r = executeSQL(testName, txnHandle, "create table "  + testName + "(a int, b varchar(50))", null);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			if (r.result == false) {
@@ -4363,7 +4963,7 @@ public class TestDriver implements Runnable{
 			arguments.put(rec1);
 			arguments.put(rec2);
 
-			r = executeSQL(testDBPath, txnHandle, "insert into " + testName + "(a,b) values(?, ?)", arguments);
+			r = executeSQL(testName, txnHandle, "insert into " + testName + "(a,b) values(?, ?)", arguments);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			if (r.result == false) {
@@ -4375,7 +4975,7 @@ public class TestDriver implements Runnable{
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting commit transaction"); 
 			globalTracer.debug("========================================================");
-			r = commitTransaction(testDBPath, txnHandle);
+			r = commitTransaction(testName, txnHandle);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			if (r.result == false) {
@@ -4400,7 +5000,7 @@ public class TestDriver implements Runnable{
 			arguments.put(rec1);
 			arguments.put(rec2);
 
-			r = executeSQL(testDBPath, null, "insert into " + testName + "(a,b) values(?, ?)", arguments);
+			r = executeSQL(testName, null, "insert into " + testName + "(a,b) values(?, ?)", arguments);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			if (r.result == false) {
@@ -4413,7 +5013,7 @@ public class TestDriver implements Runnable{
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting begin transaction"); 
 			globalTracer.debug("========================================================");
-			r = beginTransaction(testDBPath);
+			r = beginTransaction(testName);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			globalTracer.debug("txn-handle: " + r.txnHandle);
@@ -4434,7 +5034,7 @@ public class TestDriver implements Runnable{
 
 			arguments.put(rec1);
 
-			r = executeSQL(testDBPath, txnHandle, "insert into " + testName + "(a,b) values(?, ?)", arguments);
+			r = executeSQL(testName, txnHandle, "insert into " + testName + "(a,b) values(?, ?)", arguments);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			if (r.result == false) {
@@ -4446,7 +5046,7 @@ public class TestDriver implements Runnable{
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting rollback transaction"); 
 			globalTracer.debug("========================================================");
-			r = rollbackTransaction(testDBPath, txnHandle);
+			r = rollbackTransaction(testName, txnHandle);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			if (r.result == false) {
@@ -4459,7 +5059,7 @@ public class TestDriver implements Runnable{
 				globalTracer.debug("========================================================");
 				globalTracer.debug("Excecuting select from table"); 
 				globalTracer.debug("========================================================");
-				r = executeSQL(testDBPath, null, "select a, b from " + testName, null);
+				r = executeSQL(testName, null, "select a, b from " + testName, null);
 				globalTracer.debug("result : " + r.result);
 				globalTracer.debug("message : " + r.message);
 
@@ -4483,7 +5083,7 @@ public class TestDriver implements Runnable{
 			globalTracer.debug("========================================================");
 			globalTracer.debug("Excecuting close DB"); 
 			globalTracer.debug("========================================================");
-			r = closeDB(testDBPath);
+			r = closeDB(testName);
 			globalTracer.debug("result : " + r.result);
 			globalTracer.debug("message : " + r.message);
 			globalTracer.debug("========================================================");
@@ -4583,15 +5183,14 @@ public class TestDriver implements Runnable{
 		return jsonResponse;
 	}
 
-	public SyncLiteDBResult initializeDB(Path dbPath, String dbType, String dbName, Path syncLiteLoggerConfigPath) throws SQLException{
+	public SyncLiteDBResult initializeDB(String dbName, String dbType, String deviceName, Path syncLiteLoggerConfigPath) throws SQLException{
 		SyncLiteDBResult dbResult;
 		try {
 			JSONObject jsonRequest = new JSONObject();
-			jsonRequest.put("db-path", dbPath);
 			jsonRequest.put("db-type", dbType);
 			jsonRequest.put("db-name", dbName);
 			if (syncLiteLoggerConfigPath != null) {
-				jsonRequest.put("synclite-logger-config", syncLiteLoggerConfigPath);
+				jsonRequest.put("synclite-logger-options", loadLoggerOptions(syncLiteLoggerConfigPath));
 			}
 			jsonRequest.put("sql", "initialize");
 
@@ -4601,16 +5200,16 @@ public class TestDriver implements Runnable{
 			dbResult.result = jsonRespose.getBoolean("result");
 			dbResult.message = jsonRespose.getString("message");
 		} catch (Exception e) {
-			throw new SQLException("Failed to initialize DB : " + dbPath + " : " + e.getMessage(), e);
+			throw new SQLException("Failed to initialize DB : " + dbName + " : " + e.getMessage(), e);
 		}
 		return dbResult;
 	}
 
-	public SyncLiteDBResult beginTransaction(Path dbPath) throws SQLException {
+	public SyncLiteDBResult beginTransaction(String dbName) throws SQLException {
 		SyncLiteDBResult dbResult;
 		try {
 			JSONObject jsonRequest = new JSONObject();
-			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("db-name", dbName);
 			jsonRequest.put("sql", "begin");
 
 			JSONObject jsonRespose = processRequest(jsonRequest);
@@ -4620,16 +5219,16 @@ public class TestDriver implements Runnable{
 			dbResult.message = jsonRespose.getString("message");
 			dbResult.txnHandle = jsonRespose.getString("txn-handle");
 		} catch (Exception e) {
-			throw new SQLException("Failed to begin transaction on DB : " + dbPath + " : " + e.getMessage(), e);
+			throw new SQLException("Failed to begin transaction on DB : " + dbName + " : " + e.getMessage(), e);
 		}
 		return dbResult;
 	}
 
-	public SyncLiteDBResult commitTransaction(Path dbPath, String txnHandle) throws SQLException {
+	public SyncLiteDBResult commitTransaction(String dbName, String txnHandle) throws SQLException {
 		SyncLiteDBResult dbResult;
 		try {
 			JSONObject jsonRequest = new JSONObject();
-			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("db-name", dbName);
 			jsonRequest.put("txn-handle", txnHandle);
 			jsonRequest.put("sql", "commit");
 
@@ -4639,16 +5238,16 @@ public class TestDriver implements Runnable{
 			dbResult.result = jsonRespose.getBoolean("result");
 			dbResult.message = jsonRespose.getString("message");
 		} catch (Exception e) {
-			throw new SQLException("Failed to commit transaction on DB : " + dbPath + " : " + e.getMessage(), e);
+			throw new SQLException("Failed to commit transaction on DB : " + dbName + " : " + e.getMessage(), e);
 		}
 		return dbResult;
 	}
 
-	public SyncLiteDBResult rollbackTransaction(Path dbPath, String txnHandle) throws SQLException {
+	public SyncLiteDBResult rollbackTransaction(String dbName, String txnHandle) throws SQLException {
 		SyncLiteDBResult dbResult;
 		try {
 			JSONObject jsonRequest = new JSONObject();
-			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("db-name", dbName);
 			jsonRequest.put("sql", "rollback");
 			jsonRequest.put("txn-handle", txnHandle);
 
@@ -4658,16 +5257,16 @@ public class TestDriver implements Runnable{
 			dbResult.result = jsonRespose.getBoolean("result");
 			dbResult.message = jsonRespose.getString("message");
 		} catch (Exception e) {
-			throw new SQLException("Failed to rollback transaction on DB : " + dbPath + " : " + e.getMessage(), e);
+			throw new SQLException("Failed to rollback transaction on DB : " + dbName + " : " + e.getMessage(), e);
 		}
 		return dbResult;
 	}
 
-	public SyncLiteDBResult executeSQL(Path dbPath, String txnHandle, String sql, JSONArray arguments) throws SQLException {
+	public SyncLiteDBResult executeSQL(String dbName, String txnHandle, String sql, JSONArray arguments) throws SQLException {
 		SyncLiteDBResult dbResult;
 		try {
 			JSONObject jsonRequest = new JSONObject();
-			jsonRequest.put("db-path", dbPath);			
+			jsonRequest.put("db-name", dbName);			
 			jsonRequest.put("sql", sql);
 			if (txnHandle != null) {
 				jsonRequest.put("txn-handle", txnHandle);
@@ -4685,16 +5284,16 @@ public class TestDriver implements Runnable{
 				dbResult.resultSet = jsonResponse.getJSONArray("resultset");
 			}
 		} catch (Exception e) {
-			throw new SQLException("Failed to execute sql on DB : " + dbPath + " : " + e.getMessage(), e);
+			throw new SQLException("Failed to execute sql on DB : " + dbName + " : " + e.getMessage(), e);
 		}
 		return dbResult;
 	}
 
-	public SyncLiteDBResult closeDB(Path dbPath) throws SQLException {
+	public SyncLiteDBResult closeDB(String dbName) throws SQLException {
 		SyncLiteDBResult dbResult;
 		try {
 			JSONObject jsonRequest = new JSONObject();
-			jsonRequest.put("db-path", dbPath);
+			jsonRequest.put("db-name", dbName);
 			jsonRequest.put("sql", "close");
 
 			JSONObject jsonRespose = processRequest(jsonRequest);
@@ -4703,9 +5302,101 @@ public class TestDriver implements Runnable{
 			dbResult.result = jsonRespose.getBoolean("result");
 			dbResult.message = jsonRespose.getString("message");
 		} catch (Exception e) {
-			throw new SQLException("Failed to close DB : " + dbPath + " : " + e.getMessage(), e);
+			throw new SQLException("Failed to close DB : " + dbName + " : " + e.getMessage(), e);
 		}
 		return dbResult;
+	}
+
+	private JSONObject loadLoggerOptions(Path loggerConfigPath) throws IOException {
+		JSONObject options = new JSONObject();
+		List<String> lines = Files.readAllLines(loggerConfigPath, StandardCharsets.UTF_8);
+		for (String line : lines) {
+			String trimmed = line.trim();
+			if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+				continue;
+			}
+			String[] kv = trimmed.split("=", 2);
+			if (kv.length == 2 && !kv[0].trim().isEmpty()) {
+				options.put(kv[0].trim(), kv[1].trim());
+			}
+		}
+		return options;
+	}
+
+	private final void testQReader() throws SyncLiteTestException {
+		String testName = "testQReader";
+
+		if (!qreaderEnabled) {
+			globalTracer.debug("Skipping " + testName + ": qreader not started");
+			return;
+		}
+
+		Path qreaderTracePath = qreaderDbDir.resolve("synclite_qreader.trace");
+
+		try {
+			preTest(testName);
+
+			// ── publish 3 test messages via MQTT ─────────────────────────────────
+			// Topic format: <deviceName>/<topicName> — matches header-delimiter = /
+			String mqttTopic = QREADER_DEVICE_NAME + "/" + QREADER_TABLE;
+			String clientId = "synclite-validator-" + UUID.randomUUID();
+			try (MqttClient mqttClient = new MqttClient(MQTT_BROKER_URL, clientId, new MemoryPersistence())) {
+				MqttConnectOptions opts = new MqttConnectOptions();
+				opts.setCleanSession(true);
+				opts.setConnectionTimeout(10);
+				mqttClient.connect(opts);
+				for (int i = 1; i <= 3; i++) {
+					String payload = "val" + i + "_col1,val" + i + "_col2";
+					MqttMessage msg = new MqttMessage(payload.getBytes());
+					msg.setQos(1);
+					mqttClient.publish(mqttTopic, msg);
+					globalTracer.debug("Published MQTT message: " + payload + " to topic: " + mqttTopic);
+				}
+				mqttClient.disconnect();
+			}
+
+			// ── wait for all 3 rows to appear in the consolidated destination ───
+			Thread.sleep(2000);
+			long qreaderCommitId = 0;
+			if (Files.exists(qreaderDeviceDbPath)) {
+				try (Connection qConn = DriverManager.getConnection("jdbc:sqlite:" + qreaderDeviceDbPath);
+						Statement qStmt = qConn.createStatement();
+						ResultSet qRs = qStmt.executeQuery("SELECT MAX(commit_id) FROM synclite_txn")) {
+					if (qRs.next()) {
+						qreaderCommitId = qRs.getLong(1);
+					}
+				} catch (Exception qe) {
+					globalTracer.error("Failed to read qreader device commit id", qe);
+				}
+			}
+
+			if (qreaderCommitId == 0) {
+				String qTraceTail = "";
+				if (Files.exists(qreaderTracePath)) {
+					try {
+						List<String> traceLines = Files.readAllLines(qreaderTracePath);
+						int from = Math.max(0, traceLines.size() - 20);
+						qTraceTail = String.join("\n", traceLines.subList(from, traceLines.size()));
+					} catch (Exception ignored) {}
+				}
+				throw new SyncLiteTestException("qreader did not generate any device transaction (commit_id=0). qreader trace tail: " + qTraceTail);
+			}
+
+			waitForDbreaderReplicationRowCount(QREADER_TABLE, 3);
+
+			// ── spot-check the first message's col1 value ────────────────────────
+			List<String> col1Values = dstDBReader.readRows(
+				"SELECT col1 FROM " + this.dstTablePrefix + QREADER_TABLE + " ORDER BY col1");
+			if (col1Values.isEmpty() || !col1Values.contains("val1_col1")) {
+				throw new SyncLiteTestException("testQReader: expected 'val1_col1' in col1 results, got: " + col1Values);
+			}
+
+			postTest(testName, "PASS");
+		} catch (Exception e) {
+			globalTracer.error("Failed Test : " + testName);
+			globalTracer.error("Details : " + e.getMessage(), e);
+			postTest(testName, "FAIL");
+		}
 	}
 
 }
