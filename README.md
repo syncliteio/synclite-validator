@@ -54,9 +54,9 @@ Built WAR: `root/web/target/synclite-validator-oss.war`
 
 ## Documentation & Community
 
-- Full documentation: https://www.synclite.io/resources/documentation
+- Full documentation: https://github.com/syncliteio/SyncLite/blob/main/DOCUMENTATION.md
 - Website: https://www.synclite.io
-- Slack: https://join.slack.com/t/syncliteworkspace/shared_invite/zt-2pz945vva-uuKapsubC9Mu~uYDRKo6Jw
+- Community: https://github.com/syncliteio/SyncLite/issues
 
 ---
 
