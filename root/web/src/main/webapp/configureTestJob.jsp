@@ -42,14 +42,21 @@ Path testRoot, dbPath,stageDirPath, workDirPath;
 
 if (request.getAttribute("test-root") != null) {
 	testRoot = Path.of(request.getAttribute("test-root").toString());
-	dbPath = Path.of(testRoot.toString(), "db");
-	stageDirPath = Path.of(testRoot.toString(), "stageDir");
-	workDirPath = Path.of(testRoot.toString(), "workDir");	
 } else {
-	testRoot = Path.of(System.getProperty("user.home"), "synclite", "test");
-	dbPath = Path.of(System.getProperty("user.home"), "synclite", "test", "db");
-	stageDirPath = Path.of(System.getProperty("user.home"), "synclite", "test", "stageDir");
-	workDirPath = Path.of(System.getProperty("user.home"), "synclite", "test", "workDir");
+	testRoot = Path.of(System.getProperty("user.home"), "synclite", "tests");
+}
+dbPath = testRoot.resolve("db").resolve("validator");
+
+if (request.getAttribute("stage-dir") != null) {
+	stageDirPath = Path.of(request.getAttribute("stage-dir").toString());
+} else {
+	stageDirPath = testRoot.resolve("stageDir");
+}
+
+if (request.getAttribute("work-dir") != null) {
+	workDirPath = Path.of(request.getAttribute("work-dir").toString());
+} else {
+	workDirPath = testRoot.resolve("workDir");
 }
 
 Integer numThreads = 0;
@@ -159,8 +166,26 @@ try {
 						<td>Test Directory</td>
 						<td><input type="text" size=30 id="test-root"
 							name="test-root"
-							value="<%=testRoot%>" readonly
-							title="Specify a work directory for SyncLite Validator."/>
+							value="<%=testRoot%>"
+							title="Specify a work directory for SyncLite Validator. Will be created if missing."/>
+						</td>
+					</tr>
+
+					<tr>
+						<td>Stage Directory</td>
+						<td><input type="text" size=30 id="stage-dir"
+							name="stage-dir"
+							value="<%=stageDirPath%>"
+							title="Specify the stage directory. Will be created if missing."/>
+						</td>
+					</tr>
+
+					<tr>
+						<td>Work Directory</td>
+						<td><input type="text" size=30 id="work-dir"
+							name="work-dir"
+							value="<%=workDirPath%>"
+							title="Specify the work directory. Will be created if missing."/>
 						</td>
 					</tr>
 

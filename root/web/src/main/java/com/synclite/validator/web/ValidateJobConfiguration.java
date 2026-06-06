@@ -81,49 +81,61 @@ public class ValidateJobConfiguration extends HttpServlet {
 			doGet(request, response);
 
 			String testRoot = request.getParameter("test-root");
+			String stageDirParam = request.getParameter("stage-dir");
+			String workDirParam = request.getParameter("work-dir");
 
 			Path testRootPath, stageDirPath, commandDirPath, dbDirPath, workDirPath;
 			if ((testRoot == null) || testRoot.trim().isEmpty()) {
 				throw new ServletException("\"Test Root\" must be specified");
 			} else {
 				testRootPath = Path.of(testRoot);
-				if (! Files.exists(testRootPath)) {
-					throw new ServletException("Specified \"Test Root\" : " + testRoot + " does not exist, please specify a valid \"Data Directory\"");
+				// Auto-create test root if it doesn't exist
+				Files.createDirectories(testRootPath);
+
+				if (! testRootPath.toFile().canRead()) {
+					throw new ServletException("Specified \"Test Directory\" does not have read permission");
+				}
+
+				if (! testRootPath.toFile().canWrite()) {
+					throw new ServletException("Specified \"Test Directory\" does not have write permission");
+				}
+
+				// Resolve stage and work dirs from form (with defaults under testRoot)
+				if ((stageDirParam != null) && !stageDirParam.trim().isEmpty()) {
+					stageDirPath = Path.of(stageDirParam);
 				} else {
-					if (! testRootPath.toFile().canRead()) {
-						throw new ServletException("Specified \"Test Directory\" does not have read permission");
-					}
-
-					if (! testRootPath.toFile().canWrite()) {
-						throw new ServletException("Specified \"Test Directory\" does not have write permission");
-					}
-
-					//Delete existing directory if present and recreate	
-					if (Files.exists(testRootPath)) {
-						// Delete all the files and subdirectories in the directory
-						Files.walk(testRootPath)
-						.sorted((p1, p2) -> -p1.compareTo(p2))
-						.forEach(path -> {
-							try {
-								Files.delete(path);
-							} catch (Exception e) {
-								e.printStackTrace();
-							}
-						});
-					}
-
-					//Create db, workDir and testDir if not present 
 					stageDirPath = Path.of(testRootPath.toString(), "stageDir");
-					commandDirPath = Path.of(testRootPath.toString(), "commandDir");
-					workDirPath = Path.of(testRootPath.toString(),"workDir");
-					dbDirPath = Path.of(testRootPath.toString(),"db");
-					//Delete existing directory if present and recreate	
+				}
+				if ((workDirParam != null) && !workDirParam.trim().isEmpty()) {
+					workDirPath = Path.of(workDirParam);
+				} else {
+					workDirPath = Path.of(testRootPath.toString(), "workDir");
+				}
+				dbDirPath = Path.of(testRootPath.toString(), "db", "validator");
+				commandDirPath = Path.of(testRootPath.toString(), "commandDir");
 
-					Files.createDirectories(dbDirPath);
-					Files.createDirectories(stageDirPath);
-					Files.createDirectories(commandDirPath);
-					Files.createDirectories(workDirPath);
-				} 
+				// Clean validator-owned directories only (db, commandDir, workDir).
+				// stageDir is shared across projects so do NOT wipe it wholesale;
+				// the consolidator handles per-device staging cleanup at runtime.
+				for (Path p : new Path[] { dbDirPath, commandDirPath, workDirPath }) {
+					if (Files.exists(p)) {
+						Files.walk(p)
+							.sorted((p1, p2) -> -p1.compareTo(p2))
+							.forEach(path -> {
+								try {
+									Files.delete(path);
+								} catch (Exception e) {
+									e.printStackTrace();
+								}
+							});
+					}
+				}
+
+				// Create all required directories
+				Files.createDirectories(dbDirPath);
+				Files.createDirectories(stageDirPath);
+				Files.createDirectories(commandDirPath);
+				Files.createDirectories(workDirPath);
 			}
 
 			String testNumThreadsStr = request.getParameter("test-num-threads");

@@ -5,6 +5,9 @@
 	<groupId>com.synclite.validator</groupId>
 	<artifactId>root</artifactId>
 	<version>${revision}</version>
+	<properties>
+		<revision>oss</revision>
+	</properties>
 	<packaging>pom</packaging>
 
 
