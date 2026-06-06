@@ -110,6 +110,10 @@ public class TestDriver implements Runnable{
 	private static final String DEVICE_COMMIT_ID_READER_QUERY = "SELECT MAX(commit_id) FROM synclite_txn";
 	private static final Long CONSOLIDATION_WAIT_DURATION_MS = 600000L;
 	private static final Long CONSOLIDATION_CHECK_INTERVAL = 5000L;
+	// Number of consecutive polls where the destination synclite_metadata row is
+	// missing (-1) before we conclude the device was consolidated solely via the
+	// initial snapshot path (no CDC ops applied -> no metadata row inserted).
+	private static final int SNAPSHOT_ONLY_SETTLE_POLLS = 6;
 	private static final Long CONSOLIDATOR_JOB_WAIT_DURATION_MS = 300000L;
 
 	public TestDriver(Path testRoot, Path loggerConfig, Path consolidatorConfig, Path corePath, Integer nThr) throws SyncLiteTestException {
@@ -117,7 +121,9 @@ public class TestDriver implements Runnable{
 		this.loggerConfig = loggerConfig;		
 		this.consolidatorConfig = consolidatorConfig;
 		this.corePath = corePath;
-		this.dbDir = testRoot.resolve("db");
+		// All device directories created by the validator live under db/validator/
+		// so they coexist with sibling projects (db/rustologger, db/javalogger, ...).
+		this.dbDir = testRoot.resolve("db").resolve("validator");
 		this.stageDir = testRoot.resolve("stageDir");
 		this.workDir = testRoot.resolve("workDir");
 		this.commandDir = testRoot.resolve("commandDir");
@@ -364,7 +370,7 @@ public class TestDriver implements Runnable{
 		this.dbreaderSrcDbPath  = dbreaderSrcDbDir.resolve("source.db");
 		this.dbreaderConfigPath = dbreaderDbDir.resolve("synclite_dbreader.conf");
 		Path dbreaderMetaDbPath = dbreaderDbDir.resolve("synclite_dbreader_metadata.db");
-		Path dbreaderLoggerConf = dbreaderDbDir.resolve("synclite_logger.conf");
+		Path dbreaderLoggerConf = dbreaderDbDir.resolve("synclite.conf");
 
 		try {
 			// Clean up any stale dbreader state from a previous run
@@ -567,7 +573,7 @@ public class TestDriver implements Runnable{
 		this.qreaderDbDir = qreaderTestRoot.resolve("db");
 		this.qreaderConfigPath = qreaderDbDir.resolve("synclite-qreader.conf");
 		Path qreaderMetaDbPath = qreaderDbDir.resolve("synclite_qreader_metadata.db");
-		this.qreaderLoggerConf = qreaderDbDir.resolve("synclite_logger.conf");
+		this.qreaderLoggerConf = qreaderDbDir.resolve("synclite.conf");
 		this.qreaderDeviceDbPath = qreaderDbDir.resolve(QREADER_DEVICE_NAME + ".db");
 
 		try {
@@ -1217,6 +1223,7 @@ public class TestDriver implements Runnable{
 			long waited = 0;
 			long deviceCommitID = 0;
 			long dstCommitID = 0;
+			int consecutiveMissingDstRow = 0;
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
 				DBReader deviceDBReader;
 				Properties props = new Properties();
@@ -1237,12 +1244,30 @@ public class TestDriver implements Runnable{
 				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
-				if (deviceCommitID == dstCommitID) {
+				// Accept if destination has caught up to or past the device's last commit.
+				if (dstCommitID >= deviceCommitID && dstCommitID > 0) {
 					return;
-				} else {
-					Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
-					waited += CONSOLIDATION_CHECK_INTERVAL;
 				}
+
+				// Snapshot-only path: when device data is consolidated solely via the
+				// snapshot, no synclite_metadata row is inserted for this device on the
+				// destination, so dstCommitID stays -1 forever. Detect this case after a
+				// short settling window and let downstream data verification check the
+				// actual rows.
+				if (dstCommitID == -1) {
+					++consecutiveMissingDstRow;
+					if (consecutiveMissingDstRow >= SNAPSHOT_ONLY_SETTLE_POLLS) {
+						globalTracer.debug("No synclite_metadata row found for device " + deviceName
+								+ " after " + consecutiveMissingDstRow + " polls; assuming snapshot-only consolidation."
+								+ " Device last commit_id=" + deviceCommitID);
+						return;
+					}
+				} else {
+					consecutiveMissingDstRow = 0;
+				}
+
+				Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
+				waited += CONSOLIDATION_CHECK_INTERVAL;
 			}
 			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);
 		} catch (InterruptedException e) {
@@ -1256,6 +1281,7 @@ public class TestDriver implements Runnable{
 			long waited = 0;
 			long deviceCommitID = 0;
 			long dstCommitID = 0;
+			int consecutiveMissingDstRow = 0;
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
 				try {
 					SyncLiteDBResult r = executeSQL(deviceName, null, DEVICE_COMMIT_ID_READER_QUERY, null);
@@ -1279,12 +1305,24 @@ public class TestDriver implements Runnable{
 				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
-				if (deviceCommitID == dstCommitID) {
+				if (dstCommitID >= deviceCommitID && dstCommitID > 0) {
 					return;
-				} else {
-					Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
-					waited += CONSOLIDATION_CHECK_INTERVAL;
 				}
+
+				if (dstCommitID == -1) {
+					++consecutiveMissingDstRow;
+					if (consecutiveMissingDstRow >= SNAPSHOT_ONLY_SETTLE_POLLS) {
+						globalTracer.debug("No synclite_metadata row found for device " + deviceName
+								+ " after " + consecutiveMissingDstRow + " polls; assuming snapshot-only consolidation."
+								+ " Device last commit_id=" + deviceCommitID);
+						return;
+					}
+				} else {
+					consecutiveMissingDstRow = 0;
+				}
+
+				Thread.sleep(CONSOLIDATION_CHECK_INTERVAL);
+				waited += CONSOLIDATION_CHECK_INTERVAL;
 			}
 			throw new SyncLiteTestException("Data consolidation did not finish in " + CONSOLIDATION_WAIT_DURATION_MS + " (ms). Last read CommitID from device : " + deviceCommitID + ". Last read CommitID from destination : " + dstCommitID);
 		} catch (InterruptedException e) {
@@ -3133,7 +3171,7 @@ public class TestDriver implements Runnable{
 				store.insert(tableName, java.util.Map.of("id", 5, "name", "eve", "score", 500));
 
 				// Test rollback: rolled-back transaction must NOT appear in destination.
-				// Product bug: SyncLiteStore.rollback() currently does not suppress the log entry —
+				// Product bug: SyncLiteStore.rollback() currently does not suppress the log entry –
 				// the rolled-back row (id=99) is staged with a valid commit_id and replayed by the
 				// consolidator. If this test fails, use dumpStageDirCommandLog output to confirm.
 				store.setAutoCommit(false);
@@ -3146,7 +3184,7 @@ public class TestDriver implements Runnable{
 			try {
 				waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
 			} catch (SyncLiteTestException waitEx) {
-				globalTracer.error("[" + testName + "] waitForConsolidation timed out — dumping diagnostics");
+				globalTracer.error("[" + testName + "] waitForConsolidation timed out – dumping diagnostics");
 				dumpStageDirCommandLog(testName, 30);
 				dumpConsolidatorTrace(testName, 40);
 				throw waitEx;
@@ -3250,7 +3288,7 @@ public class TestDriver implements Runnable{
 					Jedis jedis = Jedis.builder(store).host(redisHost).port(redisPort).build()) {
 				jedis.set(keyPrefix + "k1", "v1");
 				jedis.rpush(keyPrefix + "list1", "a", "b");
-				// Test hash operations — jedis_hashes has composite PK (hash_key, field).
+				// Test hash operations – jedis_hashes has composite PK (hash_key, field).
 				// Known issue: consolidator throws "table has more than one primary key" when
 				// seeding in-memory replica for jedis_hashes. dumpConsolidatorTrace will capture
 				// the exact exception if waitForConsolidation times out.
@@ -3261,7 +3299,7 @@ public class TestDriver implements Runnable{
 			try {
 				waitForConsolidation(testName, DeviceType.SQLITE_STORE, testDBPath);
 			} catch (SyncLiteTestException waitEx) {
-				globalTracer.error("[" + testName + "] waitForConsolidation timed out — dumping diagnostics");
+				globalTracer.error("[" + testName + "] waitForConsolidation timed out – dumping diagnostics");
 				dumpStageDirCommandLog(testName, 30);
 				dumpConsolidatorTrace(testName, 60);
 				throw waitEx;
@@ -4442,7 +4480,7 @@ public class TestDriver implements Runnable{
 				globalTracer.debug("Skipping idempotency toggle in " + testName + ": config file missing at " + runtimeConsolidatorConfigPath);
 			}
 
-			// ── Phase 1: 3 initial rows replicated ───────────────────────────
+			// –– Phase 1: 3 initial rows replicated –––––––––––––––––––––––––––
 			waitForDbreaderReplicationRowCount(dbReaderTable, 3);
 			// Spot-check key columns on row id=1
 			List<String> colText = dstDBReader.readRows(
@@ -4456,7 +4494,7 @@ public class TestDriver implements Runnable{
 				throw new SyncLiteTestException("Phase 1: expected col_bigint=9000000000 for id=1, got: " + colBigint);
 			}
 
-			// ── Phase 2: UPDATE row id=2 ─────────────────────────────────────
+			// –– Phase 2: UPDATE row id=2 –––––––––––––––––––––––––––––––––––––
 			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
 					Statement stmt = conn.createStatement()) {
 				stmt.execute(
@@ -4472,7 +4510,7 @@ public class TestDriver implements Runnable{
 				throw new SyncLiteTestException("Phase 2: expected col_int=999 for id=2, got: " + colInt);
 			}
 
-			// ── Phase 3: Soft-DELETE row id=3 ────────────────────────────────
+			// –– Phase 3: Soft-DELETE row id=3 ––––––––––––––––––––––––––––––––
 			try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbreaderSrcDbPath);
 					Statement stmt = conn.createStatement()) {
 				stmt.execute(
@@ -5336,8 +5374,8 @@ public class TestDriver implements Runnable{
 		try {
 			preTest(testName);
 
-			// ── publish 3 test messages via MQTT ─────────────────────────────────
-			// Topic format: <deviceName>/<topicName> — matches header-delimiter = /
+			// –– publish 3 test messages via MQTT –––––––––––––––––––––––––––––––––
+			// Topic format: <deviceName>/<topicName> – matches header-delimiter = /
 			String mqttTopic = QREADER_DEVICE_NAME + "/" + QREADER_TABLE;
 			String clientId = "synclite-validator-" + UUID.randomUUID();
 			try (MqttClient mqttClient = new MqttClient(MQTT_BROKER_URL, clientId, new MemoryPersistence())) {
@@ -5355,7 +5393,7 @@ public class TestDriver implements Runnable{
 				mqttClient.disconnect();
 			}
 
-			// ── wait for all 3 rows to appear in the consolidated destination ───
+			// –– wait for all 3 rows to appear in the consolidated destination –––
 			Thread.sleep(2000);
 			long qreaderCommitId = 0;
 			if (Files.exists(qreaderDeviceDbPath)) {
@@ -5384,7 +5422,7 @@ public class TestDriver implements Runnable{
 
 			waitForDbreaderReplicationRowCount(QREADER_TABLE, 3);
 
-			// ── spot-check the first message's col1 value ────────────────────────
+			// –– spot-check the first message's col1 value ––––––––––––––––––––––––
 			List<String> col1Values = dstDBReader.readRows(
 				"SELECT col1 FROM " + this.dstTablePrefix + QREADER_TABLE + " ORDER BY col1");
 			if (col1Values.isEmpty() || !col1Values.contains("val1_col1")) {

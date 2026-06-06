@@ -5,11 +5,15 @@
 	<groupId>com.synclite.validator</groupId>
 	<artifactId>synclite-validator</artifactId>
 	<version>${revision}</version>
+	<properties>
+		<revision>oss</revision>
+	</properties>
 	<packaging>war</packaging>
 	<parent>
 		<groupId>com.synclite.validator</groupId>
 		<artifactId>root</artifactId>
 		<version>${revision}</version>
+	
 	</parent>
 	<build>
 		<plugins>
