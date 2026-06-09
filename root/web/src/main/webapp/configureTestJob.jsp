@@ -43,7 +43,7 @@ Path testRoot, dbPath,stageDirPath, workDirPath;
 if (request.getAttribute("test-root") != null) {
 	testRoot = Path.of(request.getAttribute("test-root").toString());
 } else {
-	testRoot = Path.of(System.getProperty("user.home"), "synclite", "tests");
+	testRoot = Path.of(System.getProperty("user.home"), "synclite", "test", "validator");
 }
 dbPath = testRoot.resolve("db").resolve("validator");
 
