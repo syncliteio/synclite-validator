@@ -65,7 +65,7 @@ import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
-import io.synclite.logger.*;
+import io.synclite.*;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -110,7 +110,7 @@ public class TestDriver implements Runnable{
 	private static final String DEVICE_COMMIT_ID_READER_QUERY = "SELECT MAX(commit_id) FROM synclite_txn";
 	private static final Long CONSOLIDATION_WAIT_DURATION_MS = 600000L;
 	private static final Long CONSOLIDATION_CHECK_INTERVAL = 5000L;
-	// Number of consecutive polls where the destination synclite_metadata row is
+	// Number of consecutive polls where the destination synclite_checkpoint row is
 	// missing (-1) before we conclude the device was consolidated solely via the
 	// initial snapshot path (no CDC ops applied -> no metadata row inserted).
 	private static final int SNAPSHOT_ONLY_SETTLE_POLLS = 6;
@@ -138,18 +138,18 @@ public class TestDriver implements Runnable{
 			insertPstmtValidatorDB = validatorDBConn.prepareStatement("INSERT INTO test_results(test_name, start_time, end_time, execution_time, status) VALUES(?, ?, ?, ?, ?)");
 			updatePstmtValidatorDB = validatorDBConn.prepareStatement("UPDATE test_results SET end_time = ?, execution_time = ?, status = ? WHERE test_name = ?");
 
-			Class.forName("io.synclite.logger.SQLite");
-			Class.forName("io.synclite.logger.SQLiteAppender");
-			Class.forName("io.synclite.logger.DuckDB");
-			Class.forName("io.synclite.logger.DuckDBAppender");
-			Class.forName("io.synclite.logger.Derby");
-			Class.forName("io.synclite.logger.DerbyAppender");
-			Class.forName("io.synclite.logger.H2");
-			Class.forName("io.synclite.logger.H2Appender");
-			Class.forName("io.synclite.logger.HyperSQL");
-			Class.forName("io.synclite.logger.HyperSQLAppender");
-			Class.forName("io.synclite.logger.Streaming");
-			Class.forName("io.synclite.logger.SQLiteStore");
+			Class.forName("io.synclite.SQLite");
+			Class.forName("io.synclite.SQLiteAppender");
+			Class.forName("io.synclite.DuckDB");
+			Class.forName("io.synclite.DuckDBAppender");
+			Class.forName("io.synclite.Derby");
+			Class.forName("io.synclite.DerbyAppender");
+			Class.forName("io.synclite.H2");
+			Class.forName("io.synclite.H2Appender");
+			Class.forName("io.synclite.HyperSQL");
+			Class.forName("io.synclite.HyperSQLAppender");
+			Class.forName("io.synclite.Streaming");
+			Class.forName("io.synclite.SQLiteStore");
 
 			loadConsolidatorConfig();
 
@@ -1202,7 +1202,7 @@ public class TestDriver implements Runnable{
 			long waited = 0;
 			while (waited <= CONSOLIDATION_WAIT_DURATION_MS) {
 				try {
-					String dstQuery = "SELECT commit_id FROM " + dstTablePrefix + "synclite_metadata";
+					String dstQuery = "SELECT commit_id FROM " + dstTablePrefix + "synclite_checkpoint";
 					dstDBReader.readScalarLong(dstQuery);
 					globalTracer.debug("Verified Data Consolidation startup");
 					return;
@@ -1241,7 +1241,7 @@ public class TestDriver implements Runnable{
 					deviceDBReader = new DBReader(DstType.SQLITE, "jdbc:sqlite:" + devicePath.toString(), props, this.globalTracer);
 				}
 				deviceCommitID = deviceDBReader.readScalarLong(DEVICE_COMMIT_ID_READER_QUERY);
-				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
+				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_checkpoint WHERE synclite_device_name = '" + deviceName + "'";
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
 				// Accept if destination has caught up to or past the device's last commit.
@@ -1249,17 +1249,14 @@ public class TestDriver implements Runnable{
 					return;
 				}
 
-				// Snapshot-only path: when device data is consolidated solely via the
-				// snapshot, no synclite_metadata row is inserted for this device on the
-				// destination, so dstCommitID stays -1 forever. Detect this case after a
-				// short settling window and let downstream data verification check the
-				// actual rows.
-				if (dstCommitID == -1) {
+				// Snapshot-only short-circuit: only valid when the device itself produced
+				// zero commits (deviceCommitID <= 0). Otherwise a missing destination row
+				// just means the consolidator hasn't applied yet — keep polling.
+				if (dstCommitID == -1 && deviceCommitID <= 0) {
 					++consecutiveMissingDstRow;
 					if (consecutiveMissingDstRow >= SNAPSHOT_ONLY_SETTLE_POLLS) {
-						globalTracer.debug("No synclite_metadata row found for device " + deviceName
-								+ " after " + consecutiveMissingDstRow + " polls; assuming snapshot-only consolidation."
-								+ " Device last commit_id=" + deviceCommitID);
+						globalTracer.debug("No synclite_checkpoint row found for device " + deviceName
+								+ " after " + consecutiveMissingDstRow + " polls and device has no commits; assuming snapshot-only consolidation.");
 						return;
 					}
 				} else {
@@ -1302,19 +1299,20 @@ public class TestDriver implements Runnable{
 					globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + e.getMessage(), e);
 				}
 
-				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_metadata WHERE synclite_device_name = '" + deviceName + "'";
+				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_checkpoint WHERE synclite_device_name = '" + deviceName + "'";
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
 				if (dstCommitID >= deviceCommitID && dstCommitID > 0) {
 					return;
 				}
 
-				if (dstCommitID == -1) {
+				// Snapshot-only short-circuit: only valid when the device itself produced
+				// zero commits. Otherwise keep polling until the consolidator catches up.
+				if (dstCommitID == -1 && deviceCommitID <= 0) {
 					++consecutiveMissingDstRow;
 					if (consecutiveMissingDstRow >= SNAPSHOT_ONLY_SETTLE_POLLS) {
-						globalTracer.debug("No synclite_metadata row found for device " + deviceName
-								+ " after " + consecutiveMissingDstRow + " polls; assuming snapshot-only consolidation."
-								+ " Device last commit_id=" + deviceCommitID);
+						globalTracer.debug("No synclite_checkpoint row found for device " + deviceName
+								+ " after " + consecutiveMissingDstRow + " polls and device has no commits; assuming snapshot-only consolidation.");
 						return;
 					}
 				} else {
@@ -4350,18 +4348,18 @@ public class TestDriver implements Runnable{
 	@Override
 	public final void run() {
 		try {
-			Class.forName("io.synclite.logger.SQLite");
-			Class.forName("io.synclite.logger.SQLiteAppender");
-			Class.forName("io.synclite.logger.DuckDB");
-			Class.forName("io.synclite.logger.DuckDBAppender");
-			Class.forName("io.synclite.logger.Derby");
-			Class.forName("io.synclite.logger.DerbyAppender");
-			Class.forName("io.synclite.logger.H2");
-			Class.forName("io.synclite.logger.H2Appender");
-			Class.forName("io.synclite.logger.HyperSQL");
-			Class.forName("io.synclite.logger.HyperSQLAppender");			
-			Class.forName("io.synclite.logger.SQLiteStore");
-			Class.forName("io.synclite.logger.Streaming");
+			Class.forName("io.synclite.SQLite");
+			Class.forName("io.synclite.SQLiteAppender");
+			Class.forName("io.synclite.DuckDB");
+			Class.forName("io.synclite.DuckDBAppender");
+			Class.forName("io.synclite.Derby");
+			Class.forName("io.synclite.DerbyAppender");
+			Class.forName("io.synclite.H2");
+			Class.forName("io.synclite.H2Appender");
+			Class.forName("io.synclite.HyperSQL");
+			Class.forName("io.synclite.HyperSQLAppender");			
+			Class.forName("io.synclite.SQLiteStore");
+			Class.forName("io.synclite.Streaming");
 			runTests();
 			stopJobs();
 		} catch (Exception e) {
