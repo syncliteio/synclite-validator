@@ -6,7 +6,7 @@
 	<artifactId>root</artifactId>
 	<version>${revision}</version>
 	<properties>
-		<revision>oss</revision>
+		<revision>1.0.0</revision>
 	</properties>
 	<packaging>pom</packaging>
 
