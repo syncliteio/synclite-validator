@@ -1,10 +1,10 @@
-# SyncLite Validator – End-to-End Integration Testing Tool
+# SyncLite Validator ï¿½ End-to-End Integration Testing Tool
 
-> Part of the [SyncLite Platform](https://github.com/syncliteio/SyncLite) – Build Anything, Sync Anywhere.
+> Part of the [SyncLite Platform](https://github.com/syncliteio/SyncLite) ï¿½ Build Anything, Sync Anywhere.
 
 ## What is SyncLite Validator?
 
-**SyncLite Validator** is the end-to-end (E2E) integration testing and data quality verification tool for SyncLite pipelines. It drives synthetic workloads through the full SyncLite pipeline – from edge device through staging storage through consolidation into the destination – and automatically validates that every row, every transaction, and every schema change arrived correctly and in the expected state.
+**SyncLite Validator** is the end-to-end (E2E) integration testing and data quality verification tool for SyncLite pipelines. It drives synthetic workloads through the full SyncLite pipeline ï¿½ from edge device through staging storage through consolidation into the destination ï¿½ and automatically validates that every row, every transaction, and every schema change arrived correctly and in the expected state.
 
 It is used by SyncLite developers for regression testing of the platform and by adopters to verify their pipeline configuration before going to production.
 
@@ -19,13 +19,13 @@ Validator (workload generator)
 
 ## Key Features
 
-- **Automated E2E verification** – generates a configurable workload, waits for consolidation, then compares source and destination row by row
-- **Multiple device types** – validates all SyncLite device types (SQLite, DuckDB, Derby, H2, HyperSQL, Streaming)
-- **Schema evolution testing** – validates DDL changes (ALTER TABLE, new tables) propagate correctly
-- **Transaction integrity** – verifies committed vs. rolled-back transactions are reflected correctly at the destination
-- **Configurable workloads** – control table count, row count, update/delete ratios, and concurrency
-- **Detailed diff reports** – row-level mismatch reports with source vs. destination values
-- **Web UI** – configure test runs, view progress, and inspect results from a browser
+- **Automated E2E verification** ï¿½ generates a configurable workload, waits for consolidation, then compares source and destination row by row
+- **Multiple device types** ï¿½ validates all SyncLite device types (SQLite, DuckDB, Derby, H2, HyperSQL, Streaming)
+- **Schema evolution testing** ï¿½ validates DDL changes (ALTER TABLE, new tables) propagate correctly
+- **Transaction integrity** ï¿½ verifies committed vs. rolled-back transactions are reflected correctly at the destination
+- **Configurable workloads** ï¿½ control table count, row count, update/delete ratios, and concurrency
+- **Detailed diff reports** ï¿½ row-level mismatch reports with source vs. destination values
+- **Web UI** ï¿½ configure test runs, view progress, and inspect results from a browser
 
 ## Quick Start
 
@@ -42,7 +42,7 @@ cd synclite-validator/root
 mvn -Drevision=1.0.0 clean install
 ```
 
-Built WAR: `root/web/target/synclite-validator-oss.war`
+Built WAR: `root/web/target/synclite-validator-1.0.0.war`
 
 ## Related Components
 
