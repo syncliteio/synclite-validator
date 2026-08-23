@@ -39,10 +39,10 @@ Validator (workload generator)
 
 ```bash
 cd synclite-validator/root
-mvn -Drevision=1.0.0 clean install
+mvn -Drevision=1.1.0 clean install
 ```
 
-Built WAR: `root/web/target/synclite-validator-1.0.0.war`
+Built WAR: `root/web/target/synclite-validator-1.1.0.war`
 
 ## Related Components
 
