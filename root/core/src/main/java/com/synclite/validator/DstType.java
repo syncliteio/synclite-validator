@@ -25,5 +25,13 @@ public enum DstType {
 	POSTGRESQL,
 	MSSQL,
 	MYSQL,
-	SNOWFLAKE
+	SNOWFLAKE;
+
+	/**
+	 * Whether dest SQL should be qualified with {@code dst-database} (catalog).
+	 * PostgreSQL is connected to that database via JDBC, so queries use schema.table only.
+	 */
+	boolean includeCatalogInTablePrefix() {
+		return this != POSTGRESQL;
+	}
 }
