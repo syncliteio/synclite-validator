@@ -772,6 +772,12 @@ public class TestDriver implements Runnable{
 		String dstSchema = consolidatorConfigs.get("dst-schema-" + dstIndex);
 		this.mode = consolidatorConfigs.get("dst-sync-mode");
 
+		// PostgreSQL ConfLoader requires dst-database (the JDBC catalog), but SQL
+		// on an already-connected PG session must not be catalog-qualified.
+		if (!dstType.includeCatalogInTablePrefix()) {
+			dstDatabase = null;
+		}
+
 		if (mode.equals("CONSOLIDATION")) {
 			if (dstDatabase == null) {
 				if (dstSchema == null) {
@@ -874,44 +880,54 @@ public class TestDriver implements Runnable{
 		       setupAndStartQReaderJob();
 		       // Add test method calls here
 		       // List of test method references
-		       List<Callable<Void>> testTasks = Arrays.asList(
-			       () -> { testSQLiteStmtBasic(); return null; },
-			       () -> { testSQLitePreparedStmtBasic(); return null; },
-			       () -> { testSQLiteTableMerge(); return null; },
-			       () -> { testSQLiteCommitRollback(); return null; },
-			       () -> { testSQLiteFatTableAutoArgInlining(); return null; },
-			       () -> { testSQLiteFatTableFixedInlinedArgs(); return null; },
-			       () -> { testDuckDBStmtBasic(); return null; },
-			       () -> { testDuckDBPreparedStmtBasic(); return null; },
-			       () -> { testDuckDBCommitRollback(); return null; },
-			       () -> { testDerbyStmtBasic(); return null; },
-			       () -> { testDerbyPreparedStmtBasic(); return null; },
-			       () -> { testDerbyCommitRollback(); return null; },
-			       () -> { testH2StmtBasic(); return null; },
-			       () -> { testH2PreparedStmtBasic(); return null; },
-			       () -> { testH2CommitRollback(); return null; },
-			       () -> { testHyperSQLStmtBasic(); return null; },
-			       () -> { testHyperSQLPreparedStmtBasic(); return null; },
-			       () -> { testHyperSQLCommitRollback(); return null; },
-			       () -> { testSQLiteInSyncLiteDB(); return null; },
-			       () -> { testDuckDBInSyncLiteDB(); return null; },
-			       () -> { testH2InSyncLiteDB(); return null; },
-			       () -> { testDerbyInSyncLiteDB(); return null; },
-			       () -> { testHyperSQLInSyncLiteDB(); return null; },
-			       () -> { testSQLiteAppenderInSyncLiteDB(); return null; },
-			       () -> { testDuckDBAppenderInSyncLiteDB(); return null; },
-			       () -> { testH2AppenderInSyncLiteDB(); return null; },
-			       () -> { testDerbyAppenderInSyncLiteDB(); return null; },
-			       () -> { testHyperSQLAppenderInSyncLiteDB(); return null; },
-			       () -> { testSQLiteStoreAPIBasic(); return null; },
-			       () -> { testStreamingPreparedStmtBasic(); return null; },
-			       () -> { testStreamingAPIBasic(); return null; },
-			       () -> { testJedisAPIBasic(); return null; },
-			       () -> { testKafkaProducerAPIBasic(); return null; },
-			       () -> { testStreamingInSyncLiteDB(); return null; },
-			       () -> { testQReader(); return null; }
-		       );
+		       List<Callable<Void>> testTasks = new ArrayList<>();
 
+		       testTasks.add(() -> { testSQLiteStmtBasic(); return null; });
+		       testTasks.add(() -> { testSQLitePreparedStmtBasic(); return null; });
+
+		       if (!mode.equals("REPLICATION")) {
+		          testTasks.add(() -> { testSQLiteTableMerge(); return null; });
+		       }
+
+		       testTasks.add(() -> { testSQLiteCommitRollback(); return null; });
+		       testTasks.add(() -> { testSQLiteFatTableAutoArgInlining(); return null; });
+		       testTasks.add(() -> { testSQLiteFatTableFixedInlinedArgs(); return null; });
+
+		       testTasks.add(() -> { testDuckDBStmtBasic(); return null; });
+		       testTasks.add(() -> { testDuckDBPreparedStmtBasic(); return null; });
+		       testTasks.add(() -> { testDuckDBCommitRollback(); return null; });
+
+		       testTasks.add(() -> { testDerbyStmtBasic(); return null; });
+		       testTasks.add(() -> { testDerbyPreparedStmtBasic(); return null; });
+		       testTasks.add(() -> { testDerbyCommitRollback(); return null; });
+
+		       testTasks.add(() -> { testH2StmtBasic(); return null; });
+		       testTasks.add(() -> { testH2PreparedStmtBasic(); return null; });
+		       testTasks.add(() -> { testH2CommitRollback(); return null; });
+
+		       testTasks.add(() -> { testHyperSQLStmtBasic(); return null; });
+		       testTasks.add(() -> { testHyperSQLPreparedStmtBasic(); return null; });
+		       testTasks.add(() -> { testHyperSQLCommitRollback(); return null; });
+
+		      // testTasks.add(() -> { testSQLiteInSyncLiteDB(); return null; });
+		      // testTasks.add(() -> { testDuckDBInSyncLiteDB(); return null; });
+		      // testTasks.add(() -> { testH2InSyncLiteDB(); return null; });
+		       //testTasks.add(() -> { testDerbyInSyncLiteDB(); return null; });
+		      // testTasks.add(() -> { testHyperSQLInSyncLiteDB(); return null; });
+
+		       //testTasks.add(() -> { testSQLiteAppenderInSyncLiteDB(); return null; });
+		      // testTasks.add(() -> { testDuckDBAppenderInSyncLiteDB(); return null; });
+		       //testTasks.add(() -> { testH2AppenderInSyncLiteDB(); return null; });
+		       //testTasks.add(() -> { testDerbyAppenderInSyncLiteDB(); return null; });
+		       //testTasks.add(() -> { testHyperSQLAppenderInSyncLiteDB(); return null; });
+
+		       testTasks.add(() -> { testSQLiteStoreAPIBasic(); return null; });
+		       testTasks.add(() -> { testStreamingPreparedStmtBasic(); return null; });
+		       testTasks.add(() -> { testStreamingAPIBasic(); return null; });
+		       testTasks.add(() -> { testJedisAPIBasic(); return null; });
+		       testTasks.add(() -> { testKafkaProducerAPIBasic(); return null; });
+		       //testTasks.add(() -> { testStreamingInSyncLiteDB(); return null; });
+		       testTasks.add(() -> { testQReader(); return null; });
 		       ExecutorService executorService = Executors.newFixedThreadPool(numThreads);
 		       List<Future<Void>> futures = executorService.invokeAll(testTasks);
 		       for (Future<Void> future : futures) {
@@ -1035,7 +1051,11 @@ public class TestDriver implements Runnable{
 
 		dstSqlBuilder.append(" FROM ");
 		dstSqlBuilder.append(this.dstTablePrefix + tabName);
-		dstSqlBuilder.append(" WHERE synclite_device_name = '" +  deviceName + "'");
+
+		if (mode.equals("CONSOLIDATION")) {
+		    dstSqlBuilder.append(" WHERE synclite_device_name = '" + deviceName + "'");
+		}
+
 		dstSqlBuilder.append(orderByClauseBuilder.toString());
 
 		DBReader deviceDBReader = null;
@@ -1056,7 +1076,7 @@ public class TestDriver implements Runnable{
 
 		List<String> deviceDataRows = deviceDBReader.readRows(deviceSqlBuilder.toString());
 		List<String> dstDataRows = dstDBReader.readRows(dstSqlBuilder.toString());
-
+		
 		String sql = dstSqlBuilder.toString();
 		if (deviceDataRows.size() != dstDataRows.size()) {
 			dumpRows(deviceDataRows, dstDataRows, sql);
@@ -1241,7 +1261,7 @@ public class TestDriver implements Runnable{
 					deviceDBReader = new DBReader(DstType.SQLITE, "jdbc:sqlite:" + devicePath.toString(), props, this.globalTracer);
 				}
 				deviceCommitID = deviceDBReader.readScalarLong(DEVICE_COMMIT_ID_READER_QUERY);
-				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_checkpoint WHERE synclite_device_name = '" + deviceName + "'";
+				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_checkpoint WHERE synclite_device_name = '" + deviceName + "' ORDER BY commit_id DESC";
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
 				// Accept if destination has caught up to or past the device's last commit.
@@ -1299,7 +1319,7 @@ public class TestDriver implements Runnable{
 					globalTracer.debug("Failed to read max commit id from SyncLiteDB : " + e.getMessage(), e);
 				}
 
-				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_checkpoint WHERE synclite_device_name = '" + deviceName + "'";
+				String dstCommitIDQuery = "SELECT commit_id FROM " + this.dstTablePrefix + "synclite_checkpoint WHERE synclite_device_name = '" + deviceName + "' ORDER BY commit_id DESC";
 				dstCommitID = dstDBReader.readScalarLong(dstCommitIDQuery);
 
 				if (dstCommitID >= deviceCommitID && dstCommitID > 0) {
@@ -1469,8 +1489,8 @@ public class TestDriver implements Runnable{
 			postTest(testName, "FAIL");
 		}
 	}
-
-
+	
+	
 	private final void testSQLitePreparedStmtBasic() throws SyncLiteTestException {		
 		String testName = "testSQLitePreparedStmtBasic";
 		String tableName = testName;

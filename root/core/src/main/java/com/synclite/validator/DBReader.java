@@ -59,7 +59,13 @@ public class DBReader {
 								if (!firstField) {
 									rowBuilder.append("|");
 								}
-								rowBuilder.append(rs.getString(i));
+								Object value = rs.getObject(i);
+
+								if (value instanceof byte[]) {
+								    rowBuilder.append(new String((byte[]) value, java.nio.charset.StandardCharsets.UTF_8));
+								} else {
+								    rowBuilder.append(value);
+								}
 								firstField = false;
 							}
 							result.add(rowBuilder.toString());
@@ -81,6 +87,8 @@ public class DBReader {
 
 	public long readScalarLong(String sql) throws SyncLiteTestException, InterruptedException {
 		for (int attempt=1 ; attempt<= RETRY_QUERY_COUNT ; ++attempt) {
+			// Open a fresh connection on every poll so a dest file created after
+			// an earlier SQLITE_CANTOPEN is visible on the next attempt.
 			try (Connection conn = DriverManager.getConnection(this.connStr, this.props)) {
 				try (Statement stmt = conn.createStatement()) {
 					try (ResultSet rs = stmt.executeQuery(sql)) {
@@ -91,6 +99,11 @@ public class DBReader {
 				}
 				return -1;
 			} catch (SQLException e) {
+				if (isDestNotReady(e)) {
+					// Distinguish from "query ran, no row" (-1). Callers that poll for
+					// table existence (waitForConsolidationStartup) must keep waiting.
+					throw new SyncLiteTestException("Destination not ready yet: " + e.getMessage(), e);
+				}
 				if (attempt < RETRY_QUERY_COUNT) {
 					tracer.error("failed to read scalar long from " + dbType + " at URL : " + connStr + " with sql : " + sql + " with error : ", e);
 					Thread.sleep(RETRY_QUERY_INTERVAL_MS);
@@ -101,5 +114,28 @@ public class DBReader {
 		}
 		return -1;
 	}
-	
+
+	/**
+	 * True when the destination is not ready yet: dest file missing, SQLITE_CANTOPEN,
+	 * or the queried table has not been created. Callers should poll again.
+	 */
+	private static boolean isDestNotReady(SQLException e) {
+		// SQLITE_CANTOPEN
+		if (e.getErrorCode() == 14) {
+			return true;
+		}
+		String msg = e.getMessage();
+		if (msg == null) {
+			return false;
+		}
+		String lower = msg.toLowerCase();
+		return lower.contains("no such table")
+				|| lower.contains("sqlite_cantopen")
+				|| lower.contains("unable to open")
+				|| lower.contains("cannot open")
+				|| lower.contains("does not exist")
+				|| lower.contains("no such file")
+				|| lower.contains("the system cannot find the file");
+	}
+
 }
