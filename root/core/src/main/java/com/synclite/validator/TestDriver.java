@@ -981,101 +981,46 @@ public class TestDriver implements Runnable{
 	       });
 
 	       if (!mode.equals("REPLICATION")) {
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteTableMergeEmbedded();
-	       return null;
-	       });
-	       }
+	       embeddedTestTasks.add(() -> {testSQLiteTableMergeEmbedded(); return null; });}
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteCommitRollbackEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteCommitRollbackEmbedded(); return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteFatTableAutoArgInliningEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteFatTableAutoArgInliningEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteFatTableFixedInlinedArgsEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteFatTableFixedInlinedArgsEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testDuckDBStmtBasicEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testDuckDBStmtBasicEmbedded(); return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testDuckDBPreparedStmtBasicEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testDuckDBPreparedStmtBasicEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testDuckDBCommitRollbackEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testDuckDBCommitRollbackEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteStorePreparedStmtBasicEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteStorePreparedStmtBasicEmbedded(); return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteStoreFatTableAutoArgInliningEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteStoreFatTableAutoArgInliningEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteStoreFatTableFixedInlinedArgsEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteStoreFatTableFixedInlinedArgsEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteStoreInsertWithColListEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteStoreInsertWithColListEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteAppenderPreparedStmtBasicEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteAppenderPreparedStmtBasicEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testDuckDBAppenderPreparedStmtBasicEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testDuckDBAppenderPreparedStmtBasicEmbedded();return null;});
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteAppenderFatTableAutoArgInliningEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> { testSQLiteAppenderFatTableAutoArgInliningEmbedded(); return null; });
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteAppenderFatTableFixedInlinedArgsEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> {testSQLiteAppenderFatTableFixedInlinedArgsEmbedded(); return null; });
 
-	       embeddedTestTasks.add(() -> {
-	       testSQLiteAppenderInsertWithColListEmbedded();
-	       return null;
-	       });
+	       embeddedTestTasks.add(() -> { testSQLiteAppenderInsertWithColListEmbedded(); return null; });
 
-	       ExecutorService embeddedExecutor =
-	       Executors.newFixedThreadPool(numThreads);
+	       ExecutorService embeddedExecutor = Executors.newFixedThreadPool(numThreads);
 
 	       try {
-	       List<Future<Void>> embeddedFutures =
-	       embeddedExecutor.invokeAll(embeddedTestTasks);
+	       List<Future<Void>> embeddedFutures = embeddedExecutor.invokeAll(embeddedTestTasks);
 
-	       for (Future<Void> future : embeddedFutures) {
-	           future.get();
-	       }
+	       for (Future<Void> future : embeddedFutures) {future.get();}
 
-	       } finally {
-	       embeddedExecutor.shutdown();
-	       }
+	       } finally { embeddedExecutor.shutdown();}
 	}
 	//
 	//=================================================
